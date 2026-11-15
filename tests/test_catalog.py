@@ -1,4 +1,4 @@
-"""Every manifest passes the platform's own checks, as an install runs them (its api_server/src/agents/manifest.py,
+"""Every manifest passes the platform's own checks, as an install runs them (its src/api_server/agents/manifest.py,
 from the platform's checkout beside this repository); and catalog/catalog.json is schema 3, offers every agent at
 its folder's version and manifest, and names files that are the bytes it says (each at its version's release, as
 built in catalog/), each program a zip with `start` at its root."""
@@ -19,14 +19,18 @@ FOLDERS = sorted(path for path in ROOT.iterdir() if (path / "manifest.yaml").is_
 
 
 #: The platform's checks, in its checkout beside this one: decentai-engine, or under its earlier name, decentai.
-PLATFORM_MANIFEST = next((found for found in (REPOSITORY.parent / name / "api_server" / "src" / "agents" / "manifest.py"
-                         for name in ("decentai-engine", "decentai")) if found.is_file()),
-                        REPOSITORY.parent / "decentai-engine" / "api_server" / "src" / "agents" / "manifest.py")
+#: The platform is closed source: where its checkout is not beside this one, these checks are skipped.
+PLATFORM_MANIFEST = next((found for name in ("decentai-engine", "decentai")
+                          for found in (REPOSITORY.parent / name / "src" / "api_server" / "agents" / "manifest.py",
+                                        REPOSITORY.parent / name / "api_server" / "src" / "agents" / "manifest.py")
+                          if found.is_file()), None)
 
 
 @pytest.fixture(scope="module")
 def standard():
     """The platform's Standard, loaded by its file's path."""
+    if PLATFORM_MANIFEST is None:
+        pytest.skip("the platform's own manifest checks need its checkout beside this repository")
     spec = importlib.util.spec_from_file_location(
         "platform_manifest", PLATFORM_MANIFEST)
     module = importlib.util.module_from_spec(spec)

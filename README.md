@@ -2,8 +2,8 @@
 
 The browser agent for DecentAI, in a catalog of its own: a real web browser, driven by the chat's model, on any
 site. What it does and how it keeps you in charge: [agents/browser/README.md](agents/browser/README.md). It is
-written to the platform's agent standard (`documentation/agents.md` in
-[the platform](https://github.com/decentai-io/decentai-engine)), with the same `standard` library and build as
+written to the platform's agent standard
+([`STANDARD.md`](https://github.com/decentai-io/decentai-official-agents/blob/main/STANDARD.md)), with the same `standard` library and build as
 [DecentAI Agents](https://github.com/decentai-io/decentai-official-agents).
 
 ## Install it
@@ -29,8 +29,9 @@ up. A version once published never changes: raise it for any change. In Git Bash
 ## Run the tests
 
 The browser runs as its own program against a loopback shop, a real Chromium, the chat's model scripted
-([`tests/harness.py`](tests/harness.py)). The manifest is checked with the platform's own checks, from a checkout
-of the platform beside this one (as `decentai-engine`, or `decentai`).
+([`tests/harness.py`](tests/harness.py)). The manifest is also checked with the platform's own checks where a
+checkout of the platform sits beside this one (as `decentai-engine`); the platform is closed source, so elsewhere
+those checks are skipped and the rest run.
 
 ```bash
 docker run -d --name browser-test -v "$PWD:/w" python:3.12-slim sleep infinity
