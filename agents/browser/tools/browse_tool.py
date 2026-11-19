@@ -1,6 +1,21 @@
-"""The run: look, decide, act, look again — with the person's cards at
-the moments that are theirs, the live view throughout, and what was
-learned kept for next time."""
+"""The run: look, decide a few actions, act, see what changed, look
+again — with the person's cards at the moments that are theirs, the
+live view and its inspector throughout, and what was learned kept for
+next time.
+
+One model call gives up to six actions. They run in order, and the run
+goes back to the model as soon as one of them needs its eyes: it
+failed, it changed nothing, it opened another page or a dialog, or it
+read something the model must see. Every result says what the action
+changed, measured on the page's outline before and after.
+
+An action that changed nothing is not done again on the same page: a
+second try is refused and the model is told. Three actions in a row
+that changed nothing (refused or not), or a run going in circles, get
+one call at the chat's own effort to find another way; when that too
+comes to nothing, the person is offered the browser, once for a page,
+before the run gives up.
+"""
 
 from __future__ import annotations
 
@@ -8,15 +23,16 @@ import asyncio
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from standard import ResourceDenied, ToolBase
 
 from . import guards
 from .brain import Brain
-from .driver import VIEWPORT, Driver, DriverError, Snapshot
+from .driver import VIEWPORT, Driver, DriverError, Snapshot, changes
 from .inspector import InspectError
 from .judge import Judge
+from .live import Live
 from .memory import SiteNotes, cut
 from .policy import domain_of
 
@@ -26,6 +42,9 @@ HANDOFF_FRAME_SECONDS = 0.35
 #: While the person drives, frames on their own clock, this often:
 #: their hand is never made to wait for a picture.
 HANDOFF_FRAME_MIN_SECONDS = 0.1
+#: While a run works, a frame at least this often, between the ones
+#: taken after each action.
+RUN_FRAME_SECONDS = 1.0
 #: How long the input loop waits for the person's next action before
 #: looking again at whether it should end.
 INPUT_WAIT_SECONDS = 0.05
@@ -116,12 +135,14 @@ WATCH_IDLE_FRAME_SECONDS = 1.0
 
 class Kept:
     """The chat's browser, kept open between its runs: the next run
-    finds the page the last one left. One at a time — a second run
-    waits its turn on the lock."""
+    finds the page the last one left, and is told what that run did.
+    One at a time — a second run waits its turn on the lock."""
 
     def __init__(self, driver: Driver):
         self.driver = driver
         self.lock = asyncio.Lock()
+        #: what the last run in this browser did, for the next one
+        self.last = ""
 
 
 class Browser:
@@ -161,22 +182,23 @@ BROWSER = Browser()
 class BrowseTool(ToolBase):
     id = "browse"
 
-    #: The whole run stops when the page has not changed this many times
-    #: in a row after an action.
-    STUCK_AFTER = 3
-    #: A run that keeps circling after being told so ends: this many
-    #: circling actions in a row (Brain.CIRCLE_AFTER says when the
-    #: model is told; this is when nobody is listening).
-    CIRCLE_STOP = 14
-    #: This many answers in a row that could not be read as an action
-    #: end the run: the model is told each time what was wrong, and a
-    #: model that cannot answer three times will not on the tenth.
+    #: Actions in a row that changed nothing — done or refused — before
+    #: the model is asked, at the chat's effort, for another way.
+    IDLE_AFTER = 3
+    #: Those calls for another way, before the person is offered the
+    #: browser (once for a page) or the run ends.
+    AGAIN_MOST = 1
+    #: This many answers in a row that could not be read as actions end
+    #: the run: the model is told each time what was wrong, and a model
+    #: that cannot answer three times will not on the tenth.
     UNREADABLE_STOP = 3
-    #: Actions meant to change the page. Only these count towards a
-    #: page that "stopped changing": reading, recording and asking
-    #: leave it as it was, and that is not being stuck.
+    #: Actions meant to change the page: what they changed is measured.
     MOVING = frozenset(("click", "type", "select", "press", "scroll", "goto", "back",
-                        "tab", "login", "code", "download", "upload", "handoff"))
+                        "tab", "hover", "login", "code", "download", "upload", "handoff"))
+    #: Actions whose result the model must read before it does more:
+    #: the rest of their answer's actions are not run.
+    READING = frozenset(("read", "recall", "source", "network", "response", "console", "request",
+                         "extract", "script", "ask", "look", "invalid", "login", "code", "handoff"))
 
     # -- browse_screenshot ---------------------------------------------------
     async def screenshot(self, call):
@@ -187,7 +209,7 @@ class BrowseTool(ToolBase):
             await driver.start()
             await call.progress(f"Opening {url}")
             await driver.goto(url)
-            snapshot = await driver.snapshot(marks=False)
+            snapshot = await driver.snapshot(look=True)
             await call.progress("Saving the screenshot")
             saved = self._save_image(call, snapshot, "screenshot")
             await call.progress("Closing the browser")
@@ -212,7 +234,7 @@ class BrowseTool(ToolBase):
         if kept is not None:
             async with kept.lock:
                 return await self._run_in(call, kept.driver, goal, start_url,
-                                          max_steps, continuing=True)
+                                          max_steps, continuing=True, earlier=kept.last)
         if not start_url:
             # No browser and no address: where the chat's browser was
             # when it last closed, if anywhere.
@@ -227,26 +249,32 @@ class BrowseTool(ToolBase):
         return await self._run_in(call, driver, goal, start_url, max_steps, continuing=False)
 
     async def _run_in(self, call, driver: Driver, goal: str, start_url: str,
-                      max_steps: int, continuing: bool):
+                      max_steps: int, continuing: bool, earlier: str = ""):
         here = driver.page.url if continuing and driver.page is not None else ""
         domain = domain_of(start_url or here)
         brain = Brain(call)
         # The files the person handed the run, by their paths in the
         # program's home: what upload may put into a page.
         brain.files = [str(given) for given in call.inputs.get("files") or []]
-        run = _Run(call, driver, brain, goal, domain)
+        brain.memory.earlier = earlier
+        run = _Run(call, driver, brain, goal, domain, max_steps)
         try:
-            brain.notes = await run.load_notes()
+            # Whether the person asked only to look is the model's to
+            # say from the goal alone, while the browser starts.
+            mode = asyncio.ensure_future(brain.mode(goal))
+            brain.notes, session = await asyncio.gather(run.load_notes(), run.load_session())
             if not continuing:
-                await driver.start(storage_state=await run.load_session())
+                await driver.start(storage_state=session)
+            run.live.start()
             if start_url and (not continuing or domain_of(here) != domain
                               or start_url.rstrip("/") != here.rstrip("/")):
                 await call.progress(f"Opening {start_url}")
+                run.live.set(now=f"Opening {start_url}")
                 await driver.goto(start_url)
             elif continuing:
                 await call.progress(f"Continuing at {here}")
                 brain.continuing = here
-            await brain.make_plan(goal, start_url or here)
+            run.live.set(read_only=await mode)
             outcome = await run.loop(max_steps)
         except DriverError as exc:
             outcome = {"outcome": "failed", "summary": str(exc)}
@@ -255,7 +283,8 @@ class BrowseTool(ToolBase):
         finally:
             result = await run.close(outcome)
             if driver.page is not None:
-                BROWSER.keep(driver)
+                kept = BROWSER.keep(driver)
+                kept.last = brain.memory.handed_on(goal, result["outcome"], result["summary"])
                 BROWSER.remember(result.get("final_url", ""))
             else:
                 await driver.stop()
@@ -386,16 +415,24 @@ class _Run:
     #: and each of its choices.
     CARD_CHARS = 4000
     CHOICE_CHARS = 100
+    #: A press that commits, approved, is shown to the judge with the
+    #: next one that commits on its site for this many steps: one that
+    #: only confirms it is not asked again.
+    CONFIRMS_WITHIN = 3
+    #: The finish the check refuses this many times is taken anyway,
+    #: said as not confirmed on the page.
+    REFUSED_FINISH_MOST = 2
 
-    def __init__(self, call, driver: Driver, brain: Brain, goal: str, domain: str):
+    def __init__(self, call, driver: Driver, brain: Brain, goal: str, domain: str, max_steps: int = 60):
         self.call = call
         self.driver = driver
         self.brain = brain
-        self.judge = Judge(call)
+        self.judge = Judge(brain.meter)
+        self.live = Live(call, driver, goal, max_steps)
         self.goal = goal
         self.domain = domain
         self.steps = 0
-        #: answers in a row that could not be read as an action
+        #: answers in a row that could not be read as actions
         self.unreadable = 0
         self.approvals: List[str] = []
         self.handoffs = 0
@@ -410,6 +447,30 @@ class _Run:
         #: the pages where the browser was already offered to the
         #: person because the run was stuck: offered once, not for ever
         self.offered: List[str] = []
+        #: actions that changed nothing, by what they were and the page
+        #: they were done on: not done again there
+        self.idle_marks: set = set()
+        #: actions in a row that changed nothing, done or refused
+        self.idle = 0
+        #: calls for another way since the run last got anywhere
+        self.agains = 0
+        self.refused_repeats = 0
+        self.refused_finishes = 0
+        #: controls the person allowed for the rest of the run, and how
+        #: often each was approved
+        self.allowed: set = set()
+        self.approved_counts: Dict[str, int] = {}
+        #: the newest press that commits the person approved, while it
+        #: may still be confirmed: {"words", "why", "domain", "step"}
+        self.committed: Optional[Dict[str, Any]] = None
+        #: extractions run unasked until one is seen to change the page
+        self.extract_trusted = True
+        self.cards = 0
+        self.browser_ms = 0
+        #: notes for the model's next step
+        self.notes: List[str] = []
+        #: the person's hand is on the browser, and frames follow it
+        self.driving = False
 
     # -- what is kept between runs -----------------------------------------
     async def load_notes(self) -> SiteNotes:
@@ -478,108 +539,232 @@ class _Run:
 
     # -- the loop ------------------------------------------------------------
     async def loop(self, max_steps: int) -> Dict[str, Any]:
-        memory = self.brain.memory
-        unchanged, last_signature, moved = 0, "", False
-        while self.steps < max_steps:
-            # The person may speak, or take the browser, at any step.
-            for text in self.call.screen.said():
-                self.brain.hear(text)
-            # ...and may have handed it back already, inside the step
-            # before this one: that is still a take, and what they did
-            # is still told.
-            took = getattr(self.call.screen, "took", lambda: False)()
-            if took or self.call.screen.taken:
-                await self.yield_to_person()
-            snapshot = await self.driver.snapshot()
-            self.last = snapshot
-            # While a sign-in is on the page, what the page fetches is
-            # listed and never opened.
-            self.driver.inspector.guarded = any(
-                e.get("tag") == "input" and str(e.get("type") or "").lower() == "password"
-                for e in snapshot.elements)
-            await self.show(snapshot)
-            if snapshot.signature != last_signature:
-                unchanged = 0
-            elif moved:
-                unchanged += 1
-            last_signature = snapshot.signature
-            if unchanged >= BrowseTool.STUCK_AFTER:
-                ended = await self.stuck(snapshot)
+        memory, brain, live = self.brain.memory, self.brain, self.live
+        framer = asyncio.get_running_loop().create_task(self._frames())
+        fresh: Optional[Snapshot] = None
+        pictured = ""
+        look = True
+        try:
+            while self.steps < max_steps:
+                # The person may speak, or take the browser, at any step.
+                for text in self.call.screen.said():
+                    brain.hear(text)
+                took = getattr(self.call.screen, "took", lambda: False)()
+                if took or self.call.screen.taken:
+                    await self.yield_to_person()
+                    fresh, look = None, True
+                began = time.monotonic()
+                snapshot = fresh if fresh is not None else await self.driver.snapshot()
+                fresh = None
+                # A picture when the outline is not enough: the first
+                # look at a page, a page the outline says little about,
+                # a frame a person could act in, or the model asked.
+                sparse = len(snapshot.elements) < 3 and len(snapshot.outline) < 300
+                if look or snapshot.url != pictured or sparse or snapshot.frames:
+                    snapshot.image = await self.driver.picture()
+                    pictured = snapshot.url
+                look = False
+                self.browser_ms += round((time.monotonic() - began) * 1000)
+                self.last = snapshot
+                memory.seen(snapshot.url)
+                # While a sign-in is on the page, what the page fetches is
+                # listed and never opened.
+                self.driver.inspector.guarded = any(
+                    e.get("tag") == "input" and str(e.get("type") or "").lower() == "password"
+                    for e in snapshot.elements)
+                again = self.idle >= BrowseTool.IDLE_AFTER or bool(brain.circling(memory.actions))
+                if again:
+                    if self.agains >= BrowseTool.AGAIN_MOST:
+                        ended = await self.stuck(snapshot)
+                        if ended is not None:
+                            return ended
+                        self.idle, self.agains, fresh, look = 0, 0, None, True
+                        continue
+                    self.agains += 1
+                    self.idle = 0
+                    if not snapshot.image:
+                        snapshot.image = await self.driver.picture()
+
+                self.steps += 1
+                live.set(step=self.steps, status="thinking", now="Deciding what to do")
+                self._figures()
+                decision = await brain.decide(self.goal, snapshot, self.steps, max_steps, self.notes, again=again)
+                self.notes = []
+                model_ms = brain.meter.last_ms
+                live.plan(brain.plan.steps)
+                live.set(next=decision.get("next", ""), status="acting")
+                ended, fresh, look = await self.batch(decision["actions"], snapshot, model_ms)
                 if ended is not None:
                     return ended
-                unchanged, moved, last_signature = 0, False, ""
-                continue
-            circle = self.brain.circling(memory.actions[-BrowseTool.CIRCLE_STOP:]) \
-                if len(memory.actions) >= BrowseTool.CIRCLE_STOP else ""
-            if circle and all(
-                    str(a.get("action") or "") in circle.split(" / ")
-                    for a in memory.actions[-BrowseTool.CIRCLE_STOP:]):
-                return {"outcome": "failed",
-                        "summary": f"The run went in circles at {snapshot.url}: the last "
-                                   f"{BrowseTool.CIRCLE_STOP} actions were {circle}, by turns, "
-                                   f"after {self.steps} steps."}
+                self._figures()
+            summary = f"Ran out of steps ({max_steps}) at {self.last.url if self.last else ''}."
+            return {"outcome": "budget", "summary": summary}
+        finally:
+            framer.cancel()
 
-            self.steps += 1
-            await self.brain.fold(self.goal, self.steps)
-            decision = await self.brain.decide(self.goal, snapshot, self.steps, max_steps, unchanged)
-            action = dict(decision.get("action") or {})
+    async def batch(self, actions: List[Dict[str, Any]], snapshot: Snapshot,
+                    model_ms: int) -> Tuple[Optional[Dict[str, Any]], Optional[Snapshot], bool]:
+        """One answer's actions, in order, until one needs the model's
+        eyes. (A result that ends the run, the page as the last action
+        left it when that was looked at, whether the model asked for a
+        picture.)"""
+        memory, live = self.brain.memory, self.live
+        before, look = snapshot, False
+        for index, action in enumerate(actions):
             what = str(action.get("do") or "").lower()
-            await self.call.progress(self._line(action, snapshot))
+            line = self._line(action, before)
+            await self.call.progress(line)
+            live.set(now=line)
             self.unreadable = self.unreadable + 1 if what == "invalid" else 0
             if self.unreadable >= BrowseTool.UNREADABLE_STOP:
                 how = ("were cut off before they ended" if action.get("cut")
-                       else "could not be read as an action")
+                       else "could not be read as actions")
                 return {"outcome": "failed",
                         "summary": f"The model's last {self.unreadable} answers {how}, at "
-                                   f"{snapshot.url} after {self.steps} steps."}
-            moved = what in BrowseTool.MOVING
+                                   f"{before.url} after {self.steps} steps."}, None, False
+            mark = self._mark(what, action, before)
+            if mark in self.idle_marks:
+                # Done on this very page a moment ago, and it changed
+                # nothing: it is not done again.
+                self.idle += 1
+                self.refused_repeats += 1
+                result = ("not done: the same action changed nothing on this same page a moment ago — "
+                          "do something else")
+                memory.did(line, result, "refused")
+                live.acted(len(memory.actions), what, self._target(action, before), result, "refused", 0,
+                           model_ms if index == 0 else 0)
+                return None, before, look
+            began = time.monotonic()
+            verdict = ""
             try:
-                ended = await self.act(what, action, snapshot)
+                ended, result, verdict = await self.act(what, action, before)
             except (DriverError, InspectError) as exc:
-                memory.did(self._line(action, snapshot), f"failed: {exc}")
-                continue
+                elapsed = round((time.monotonic() - began) * 1000)
+                self.browser_ms += elapsed
+                memory.did(line, f"failed: {exc}", "failed")
+                live.acted(len(memory.actions), what, self._target(action, before), f"failed: {exc}", "failed",
+                           elapsed, model_ms if index == 0 else 0)
+                self.idle += 1
+                return None, None, look
             if ended is not None:
-                return ended
-            if moved:
-                # What the action did, shown at once — the next step's
-                # frame comes only after the model has thought.
+                return ended, None, look
+            state, stop = "ok", what in BrowseTool.READING
+            after: Optional[Snapshot] = None
+            if what in BrowseTool.MOVING and result is not None:
+                after = await self.driver.snapshot()
+                changed = changes(before, after)
+                result = changed["said"] if result == "ok" else f"{result}; {changed['said']}"
+                if changed["moved"]:
+                    self.idle, self.agains = 0, 0
+                else:
+                    state = "no_effect"
+                    self.idle += 1
+                    self.idle_marks.add(mark)
+                stop = stop or not changed["moved"] or after.url != before.url \
+                    or "dialog" in changed["said"] or len(after.tabs) != len(before.tabs)
+                memory.seen(after.url)
                 await self.show()
-        summary = f"Ran out of steps ({max_steps}) at {self.last.url if self.last else ''}."
-        return {"outcome": "budget", "summary": summary}
+            elif result is None:
+                # Refused by the person or the rules: said already.
+                state, stop, result = "refused", True, ""
+            elapsed = round((time.monotonic() - began) * 1000)
+            self.browser_ms += elapsed
+            if result:
+                memory.did(line, result, state)
+            live.acted(len(memory.actions), what, self._target(action, before), result or "not done",
+                       state, elapsed, model_ms if index == 0 else 0, verdict)
+            live.send()
+            if what == "look":
+                look = True
+            if after is not None:
+                before = after
+            if stop:
+                return None, (after if after is not None and what != "look" else None), look
+        return None, (before if before is not snapshot else None), look
+
+    @staticmethod
+    def _mark(what: str, action: Dict[str, Any], snapshot: Snapshot) -> str:
+        """What an action is, on the page it is done on: its kind, its
+        control by what it says, what it carries, and the page's own
+        signature."""
+        element = snapshot.element(int(action.get("n") or 0)) if action.get("n") else None
+        target = "|".join(str((element or {}).get(k) or "") for k in ("tag", "kind", "text", "label", "href")) \
+            if element else str(action.get("n") or "")
+        carried = "|".join(str(action.get(k) or "") for k in ("text", "option", "key", "direction", "url", "query"))
+        return f"{what}#{target}#{carried}#{snapshot.signature}"
+
+    @staticmethod
+    def _target(action: Dict[str, Any], snapshot: Snapshot) -> str:
+        n = int(action.get("n") or 0)
+        element = snapshot.element(n) if n else None
+        if element:
+            words = element.get("text") or element.get("label") or ""
+            return f"[{n}] {element.get('kind') or element.get('tag')} '{words}'"
+        for key in ("url", "key", "direction", "query", "question", "reason", "why"):
+            if action.get(key):
+                return str(action[key])[:160]
+        return ""
+
+    def _figures(self) -> None:
+        meter = self.brain.meter
+        self.live.count(steps=self.steps, model_calls=meter.calls, model_ms=meter.ms, browser_ms=self.browser_ms,
+                        cards=self.cards, repeats_refused=self.refused_repeats)
+
+    async def _frames(self) -> None:
+        """A frame at least every RUN_FRAME_SECONDS while the run works:
+        the page moves while the model thinks."""
+        while True:
+            await asyncio.sleep(RUN_FRAME_SECONDS)
+            try:
+                if not self.driving:
+                    await self.show()
+            except Exception:
+                pass
 
     async def stuck(self, snapshot: Snapshot) -> Optional[Dict[str, Any]]:
-        """The last actions changed nothing. The person is offered the
-        browser, once for a page: what stops a script is often a thing a
-        person sees at a glance. When they decline, or nobody is there
-        to take it, the run ends as it always did."""
+        """The run got nowhere, and another way did not help. The person
+        is offered the browser, once for a page: what stops a script is
+        often a thing a person sees at a glance. When they decline, or
+        nobody is there to take it, the run ends."""
         failed = {"outcome": "failed",
-                  "summary": f"The page stopped changing after {self.steps} steps at "
-                             f"{snapshot.url}; the last actions did nothing."}
+                  "summary": f"The run got nowhere at {snapshot.url} after {self.steps} steps: its last "
+                             f"actions changed nothing, and another way did not either."}
         if snapshot.signature in self.offered:
             return failed
         self.offered.append(snapshot.signature)
-        took = await self.handoff(
-            f"The last {BrowseTool.STUCK_AFTER} actions changed nothing on this page, and the "
-            f"way on is not clear from here.")
+        took = await self.handoff("The last actions changed nothing on this page, and the way on is not clear "
+                                  "from here.")
         return None if took else failed
 
-    async def act(self, what: str, action: Dict[str, Any], snapshot: Snapshot) -> Optional[Dict[str, Any]]:
-        """One action; a dict ends the run."""
+    async def act(self, what: str, action: Dict[str, Any],
+                  snapshot: Snapshot) -> Tuple[Optional[Dict[str, Any]], Optional[str], str]:
+        """One action: (a result that ends the run, what it gave — None
+        when it was not done — and the judge's verdict on it)."""
         driver, memory, inspector = self.driver, self.brain.memory, self.driver.inspector
         line = self._line(action, snapshot)
         result = "ok"
         n = int(action.get("n") or 0)
         element = snapshot.element(n) if n else None
+        if n and element is None and what in ("click", "type", "select", "hover", "read", "download", "upload",
+                                              "source"):
+            raise DriverError(f"there is no control [{n}] on this page now; the outline has the numbers")
 
-        if Judge.asked_for(what, action, element):
-            ended = await self.judged(what, action, element, snapshot, line)
+        verdict = ""
+        focused = None
+        if what == "press":
+            focused = snapshot.element(await self._focused())
+        if Judge.asked_for(what, action, element, focused):
+            ended, verdict, allowed = await self.judged(what, action, element, snapshot, line)
             if ended is not None:
-                return ended
+                return ended, None, verdict
+            if not allowed:
+                return None, None, verdict
 
         if what == "click":
             await driver.click(n)
         elif what == "type":
-            await driver.type(n, str(action.get("text") or ""), bool(action.get("submit")))
+            await driver.type(n, str(action.get("text") or ""), bool(action.get("submit")),
+                              keyed=str((element or {}).get("kind") or "") in Driver.KEYED)
         elif what == "select":
             await driver.select(n, str(action.get("option") or ""))
         elif what == "press":
@@ -594,6 +779,8 @@ class _Run:
             await driver.back()
         elif what == "tab":
             await driver.tab(str(action.get("action") or "new"), action.get("index"), str(action.get("url") or ""))
+        elif what == "look":
+            result = "a screenshot comes with your next turn"
         elif what == "read":
             text = await driver.read(n)
             result = f"read {len(text)} characters:\n" + cut(
@@ -624,9 +811,16 @@ class _Run:
             lines = inspector.console()
             result = cut("\n".join(lines), self.TAKEN_CHARS) if lines else "the page logged nothing"
         elif what == "request":
-            got = await inspector.request(str(action.get("url") or ""))
+            key = self.live.pend("request", f"GET {str(action.get('url') or '')[:120]}",
+                                 str(action.get("url") or ""), state="running")
+            try:
+                got = await inspector.request(str(action.get("url") or ""))
+            finally:
+                self.live.settle(key)
             result = (f"{got['status']} {got['type']} from {got['address']}, {got['size']} characters:\n"
                       + cut(str(got["text"]), self.TAKEN_CHARS, "a narrower address gives less"))
+        elif what == "extract":
+            result = await self.extract(action, snapshot)
         elif what == "script":
             result = await self.script(action, snapshot)
         elif what == "login":
@@ -654,78 +848,166 @@ class _Run:
         elif what == "ask":
             choices = [str(c)[:self.CHOICE_CHARS] for c in (action.get("choices") or [])][:8]
             question = str(action.get("question") or "Which one?")[: self.CARD_CHARS]
-            answer = await self.call.ask(question, choices=choices or None)
+            answer = await self._ask(question, choices or None)
             result = f"the person answered: {answer}" if answer is not None else "nobody answered"
         elif what == "handoff":
             if not await self.handoff(str(action.get("reason") or "the page needs a person")):
-                return {"outcome": "stopped", "summary": "Stopped at a handoff the person did not complete."}
+                return {"outcome": "stopped", "summary": "Stopped at a handoff the person did not complete."}, \
+                    None, ""
             result = "the person handed the browser back"
         elif what == "finish":
-            summary = str(action.get("summary") or "").strip()
-            claimed = str(action.get("outcome") or "done")
-            if claimed == "done":
-                verdict = await self.brain.verify(self.goal, summary, snapshot)
-                if not verdict["done"]:
-                    memory.did(line, f"not finished: {verdict['summary']}")
-                    return None
-                summary = verdict["summary"]
-            return {"outcome": "done" if claimed == "done" else "failed", "summary": summary}
+            return await self.finish(action, snapshot, line), None, ""
         elif what == "invalid":
             if action.get("cut"):
                 result = ("your answer was cut off before it ended, so nothing was done: "
-                          "answer with less — fewer and shorter records in one remember, "
-                          "shorter thinking — and never the same again")
+                          "answer with less — fewer and shorter records in one remember")
             else:
-                result = ("your answer could not be read as one JSON object with an action, "
+                result = ("your answer could not be read as one JSON object with actions, "
                           "so nothing was done: answer with the JSON object only")
         else:
             result = f"unknown action {what!r}; use one of the actions listed"
-        memory.did(line, result)
+        return None, result, verdict
+
+    async def finish(self, action: Dict[str, Any], snapshot: Snapshot, line: str) -> Optional[Dict[str, Any]]:
+        """The run's end, as the model claims it: a "done" is checked
+        against the page, and one the check refuses is told back with
+        what is missing — until it has been refused twice, when it is
+        taken, said as not confirmed."""
+        memory = self.brain.memory
+        summary = str(action.get("summary") or "").strip()
+        claimed = str(action.get("outcome") or "done")
+        if claimed != "done":
+            return {"outcome": "failed", "summary": summary}
+        self.live.set(status="thinking", now="Checking the page shows the goal done")
+        check = await self.driver.snapshot()
+        if len(check.elements) < 3 and len(check.outline) < 300:
+            check.image = await self.driver.picture()
+        verdict = await self.brain.verify(self.goal, summary, str(action.get("evidence") or ""), check)
+        if verdict["done"]:
+            return {"outcome": "done", "summary": verdict["summary"]}
+        self.refused_finishes += 1
+        if self.refused_finishes > self.REFUSED_FINISH_MOST:
+            return {"outcome": "done", "summary": f"{summary} (Not confirmed on the final page: "
+                                                  f"{verdict['missing'] or verdict['summary']})"}
+        missing = verdict["missing"] or verdict["summary"]
+        memory.did(line, f"not finished: the page does not show it yet — {missing}", "refused")
+        self.notes.append(f"the check of the page says the goal is not done yet: {missing}. Do what is "
+                          f"missing, or finish as failed if it cannot be done.")
         return None
+
+    async def _focused(self) -> int:
+        try:
+            return int(await self.driver.page.evaluate(
+                "() => Number((document.activeElement && document.activeElement.getAttribute('data-dai-mark')) || 0)"))
+        except Exception:
+            return 0
+
+    async def _ask(self, question: str, choices: Optional[List[str]]) -> Optional[str]:
+        """A card in the chat, counted."""
+        self.cards += 1
+        self._figures()
+        self.live.set(status="waiting")
+        self.live.send(force=True)
+        try:
+            return await self.call.ask(question, choices=choices)
+        finally:
+            self.live.set(status="acting")
 
     # -- the guarded moments ---------------------------------------------------
     async def judged(self, what: str, action: Dict[str, Any], element: Optional[Dict[str, Any]],
-                     snapshot: Snapshot, line: str) -> Optional[Dict[str, Any]]:
+                     snapshot: Snapshot, line: str) -> Tuple[Optional[Dict[str, Any]], str, bool]:
         """A press, judged before it lands. One that commits — or one
-        that changes anything, when the person asked only for looking —
-        stops for their say, on the platform's own card with its two
-        answers. Nothing else approves a press: not a question the mind
-        asked on its own, not a word in an answer."""
+        that changes anything, when the person asked only to look —
+        stops for their say, on the platform's own card. Nothing else
+        approves a press: not a question the mind asked on its own, not
+        a word in an answer. (A result that ends the run, the verdict,
+        whether the press may go.)"""
         n = int((element or {}).get("n") or 0)
         about = await self.driver.inspector.about(0 if what == "press" else n)
         if about is None and element is not None:
             about = {"control": {k: element.get(k) for k in
                                  ("tag", "type", "role", "text", "label", "name", "href")},
                      "title": snapshot.title}
-        found = await self.judge.verdict(self.goal, what, action, about, snapshot.url)
-        if not Judge.stops(found):
-            return None
+        domain = domain_of(snapshot.url)
+        committed = self.committed if self.committed and self.committed["domain"] == domain \
+            and self.steps - self.committed["step"] <= self.CONFIRMS_WITHIN else None
+        found = await self.judge.verdict(self.goal, what, action, about, snapshot.url, approved=committed)
         control = (about or {}).get("control") or {}
         words = str(control.get("text") or control.get("label") or control.get("name")
                     or (f"element {n}" if n else "the field in use")).strip()[:120]
         if what in ("press", "type"):
             words = f"Enter in {words}"
+        if not Judge.stops(found, self.brain.read_only):
+            if found["verdict"] == "commits" and committed:
+                # It only confirms what the person approved a moment ago.
+                self.approvals.append(f"{words} (confirming “{committed['words']}”)")
+                self.committed = None
+            return None, found["verdict"], True
+        ident = f"{domain}|{what}|{words}|{((about or {}).get('form') or {}).get('action', '')}"
+        if ident in self.allowed:
+            self.approvals.append(f"{words} (allowed for this run)")
+            return None, found["verdict"], True
         where = snapshot.url.split("?", 1)[0][:200]
-        answer = await self.call.ask(
-            f"About to press “{words}” on {where}. {found['why']} Go ahead?"[: self.CARD_CHARS],
-            choices=["Go ahead", "Stop"])
-        if answer != "Go ahead":
-            self.brain.memory.did(line, "the person did not approve it")
+        choices = ["Go ahead", "Stop"]
+        if self.approved_counts.get(ident):
+            # The same press, approved before on this run: the person may
+            # let the rest of them through.
+            choices = ["Go ahead", "Go ahead for the rest of this run", "Stop"]
+        key = self.live.pend("press", f"Press “{words}”", where, found["why"])
+        answer = await self._ask(f"About to press “{words}” on {where}. {found['why']} Go ahead?"[: self.CARD_CHARS],
+                                 choices)
+        self.live.settle(key)
+        if answer not in ("Go ahead", "Go ahead for the rest of this run"):
+            self.brain.memory.did(line, "the person did not approve it", "refused")
             # Their own Stop is said as that, and not as a run that
             # merely ended, where a plain "stopped" reads as a result to
             # try again. Nobody answering is the other case.
-            return {"outcome": "stopped_by_person" if answer == "Stop" else "stopped",
-                    "summary": f"Stopped before pressing “{words}” on {where}, as the person asked."
-                    if answer == "Stop" else
-                    f"Stopped before pressing “{words}” on {where}: nobody approved it."}
+            return ({"outcome": "stopped_by_person" if answer == "Stop" else "stopped",
+                     "summary": f"Stopped before pressing “{words}” on {where}, as the person asked."
+                     if answer == "Stop" else
+                     f"Stopped before pressing “{words}” on {where}: nobody approved it."},
+                    found["verdict"], False)
+        self.approved_counts[ident] = self.approved_counts.get(ident, 0) + 1
+        if answer == "Go ahead for the rest of this run":
+            self.allowed.add(ident)
         self.approvals.append(words)
-        return None
+        self.brain.memory.approved.append(f"“{words}” on {where}")
+        if found["verdict"] == "commits":
+            self.committed = {"words": words, "why": found["why"], "domain": domain, "step": self.steps}
+        return None, found["verdict"], True
+
+    async def extract(self, action: Dict[str, Any], snapshot: Snapshot) -> str:
+        """Code that only reads, run on a copy of the page with no way
+        out: not asked of the person — they see it in the inspector —
+        until one is seen to change the live page, after which each one
+        is asked like a script."""
+        code = str(action.get("code") or "").strip()
+        why = " ".join(str(action.get("why") or "").split())[:200]
+        if not code:
+            return "nothing was run: give the code, as the body of an async function, and the why"
+        if len(code) > 4000:
+            return "nothing was run: an extraction is at most 4000 characters"
+        if not self.extract_trusted and not await self._allows(code, why, snapshot, reads=True):
+            return "the person did not allow the extraction; do not reach for the same by another way"
+        key = self.live.pend("script", "Extract (reads a copy of the page)", code, why, state="running")
+        try:
+            found = await self.driver.inspector.extract(code)
+        finally:
+            self.live.settle(key)
+        said = ""
+        if found["touched"]:
+            self.extract_trusted = False
+            said = ("\n[the live page changed while it ran — by the page itself or by the code; from now on "
+                    "each extraction is asked of the person first]")
+        if found["failed"]:
+            return f"the extraction failed: {found['failed'][:300]}" + said
+        return "the extraction returned:\n" + cut(found["answer"], self.TAKEN_CHARS) + said
 
     async def script(self, action: Dict[str, Any], snapshot: Snapshot) -> str:
         """JavaScript in the page, when the person allows it — asked
-        every time, shown the reason and the code whole, with what the
-        assistant made of it. A script can do whatever the person can
-        do on the site, so the last word on one is theirs."""
+        every time, shown the reason and the code whole. A script can do
+        whatever the person can do on the site, so the last word on one
+        is theirs."""
         inspector = self.driver.inspector
         code = str(action.get("code") or "").strip()
         why = " ".join(str(action.get("why") or "").split())[:200]
@@ -734,28 +1016,32 @@ class _Run:
         if len(code) > inspector.SCRIPT_CHARS:
             return (f"nothing was run: a script of more than {inspector.SCRIPT_CHARS} characters "
                     f"is not put to the person, who must be able to read what they allow; "
-                    f"source, network, response and request read without one")
+                    f"extract reads without one")
         if not await self._allows(code, why, snapshot):
             return "the person did not allow the script; do not reach for the same by another way"
         self.approvals.append(f"script: {why or code[:60]}")
         self.session_dirty = True
-        return "the script returned:\n" + cut(await inspector.script(code), self.TAKEN_CHARS)
+        key = self.live.pend("script", "Script (acts in the page)", code, why, state="running")
+        try:
+            return "the script returned:\n" + cut(await inspector.script(code), self.TAKEN_CHARS)
+        finally:
+            self.live.settle(key)
 
-    async def _allows(self, code: str, why: str, snapshot: Snapshot) -> bool:
+    async def _allows(self, code: str, why: str, snapshot: Snapshot, reads: bool = False) -> bool:
         """The person's answer to a script, asked in the chat with the
         code whole and the reason beside it."""
         where = snapshot.url.split("?", 1)[0][:120]
-        answer = await self.call.ask(
-            f"Run this script on {where}?\nWhy: {why or 'no reason was given'}\n\n{code}"[: self.CARD_CHARS],
-            choices=["Run it", "Stop"])
+        kind = "this extraction (it reads a copy of the page)" if reads else "this script"
+        key = self.live.pend("script", "Waiting for your approval", code, why)
+        answer = await self._ask(
+            f"Run {kind} on {where}?\nWhy: {why or 'no reason was given'}\n\n{code}"[: self.CARD_CHARS],
+            ["Run it", "Stop"])
+        self.live.settle(key)
         return answer == "Run it"
 
     def _own_fields(self, action: Dict[str, Any], snapshot: Snapshot) -> List[Dict[str, Any]]:
         """The fields on this page that take the person's own values,
-        as the model named them — whatever the form's shape: an email
-        alone, a password alone on the next page, a company number
-        beside both, a code. The older shapes (username and password by
-        mark, a code by mark) are read as the fields they are; and with
+        as the model named them — whatever the form's shape. With
         nothing named, the form's own password field and the field
         before it."""
         said = [dict(f) for f in (action.get("fields") or []) if isinstance(f, dict)]
@@ -785,9 +1071,14 @@ class _Run:
         fields = self._own_fields(action, snapshot)
         if not fields:
             return ("nothing was filled: name the fields on this page that take the person's "
-                    "own values — login {fields: [{n, name, label}]} — by their marks")
+                    "own values — login {fields: [{n, name, label}]} — by their numbers")
         page = self.driver.page
-        values = await self._values(domain_of(snapshot.url), fields)
+        key = self.live.pend("sign_in", f"Sign-in on {domain_of(snapshot.url)}",
+                             ", ".join(f["label"] for f in fields), "the person's own values, never shown")
+        try:
+            values = await self._values(domain_of(snapshot.url), fields)
+        finally:
+            self.live.settle(key)
         if values is None:
             return "the person did not provide it; do not try to sign in another way"
         if self.driver.page is not page or domain_of(page.url) != domain_of(snapshot.url):
@@ -805,15 +1096,17 @@ class _Run:
         if not filled:
             return "the person's login holds nothing for these fields; nothing was filled"
         submit = action.get("submit")
+        marks = self.driver._marks()
         if submit is False:
             pass  # more of the form is the model's to fill before it goes
         elif int(submit or 0):
             await self.driver.click(int(submit))
         else:
-            await self.driver.press("Enter")
+            await self.driver.page.keyboard.press("Enter")
+            await self.driver._after(*marks)
         self.session_dirty = True
         return (f"filled {', '.join(filled)} from the person's own values"
-                + ("" if submit is False else " and sent the form") + "; check the page")
+                + ("" if submit is False else " and sent the form"))
 
     async def _values(self, site: str, fields: List[Dict[str, Any]]) -> Optional[Dict[str, str]]:
         """The person's values for these fields, from the site's login
@@ -848,11 +1141,18 @@ class _Run:
         page, until they hand it back — then the model is told and looks
         again at the page as they left it."""
         await self.call.progress("The person took the browser")
-        _why, trail = await drive(
-            self.call, self.driver,
-            until=lambda: "" if self.call.screen.taken else "released",
-            hear=self.brain.hear)
+        self.live.set(status="waiting", now="The person has the browser")
+        self.live.send(force=True)
+        self.driving = True
+        try:
+            _why, trail = await drive(
+                self.call, self.driver,
+                until=lambda: "" if self.call.screen.taken else "released",
+                hear=self.brain.hear)
+        finally:
+            self.driving = False
         self.session_dirty = True
+        self.idle, self.agains = 0, 0
         # What they did, in words, is the run's to learn from and the
         # site's notes to keep: the next run tries it itself.
         self._person_did(trail)
@@ -867,30 +1167,38 @@ class _Run:
         """The person takes the browser over. Frames keep flowing and
         their hand is fed to the page until they press Done."""
         self.handoffs += 1
+        self.cards += 1
+        self._figures()
         await self.call.progress(f"Handing the browser to you: {reason}")
-        before = (await self.driver.snapshot(marks=False)).signature
+        self.live.set(status="waiting", now=f"Handed to you: {reason}")
+        self.live.send(force=True)
+        before = (await self.driver.snapshot()).signature
         asking = asyncio.ensure_future(self.call.ask(
             (f"{reason} Take over the browser in the live view, do what it needs, "
              f"then choose Done.")[: self.CARD_CHARS], choices=["Done", "Stop"]))
+        self.driving = True
         try:
             _why, trail = await drive(
                 self.call, self.driver,
                 until=lambda: "answered" if asking.done() else "",
                 hear=self.brain.hear)
         finally:
+            self.driving = False
             if not asking.done():
                 asking.cancel()
         answer = asking.result() if asking.done() and not asking.cancelled() else None
+        self.live.set(status="acting")
         if answer == "Done":
             self.session_dirty = True
-            snapshot = await self.driver.snapshot(marks=False)
+            self.idle, self.agains = 0, 0
+            snapshot = await self.driver.snapshot()
             if snapshot.signature == before:
                 # Nothing visibly changed in this browser: the person may
                 # have done what was needed elsewhere (their phone, another
                 # window). Reload so the site's new state shows.
                 try:
                     await self.driver.page.reload(wait_until="domcontentloaded", timeout=15000)
-                    await self.driver.settle()
+                    await self.driver.quiet()
                 except Exception:
                     pass
             self._person_did(trail)
@@ -909,22 +1217,20 @@ class _Run:
             self.brain.notes.add("person", now_iso()[:10] + ": " + "; ".join(lines)[:TRAIL_NOTE_MAX])
 
     # -- the live view -------------------------------------------------------------
-    async def show(self, snapshot: Optional[Snapshot] = None) -> None:
+    async def show(self) -> None:
         """One frame to the live view, the size the browser's viewport
-        is — the snapshot's when one is at hand — with the open tabs."""
+        is, with the open tabs."""
         image = await self.driver.frame()
         if not image:
             return
-        if snapshot is not None:
-            width, height = snapshot.width, snapshot.height
-        else:
-            size = self.driver.page.viewport_size if self.driver.page else None
-            width, height = (size["width"], size["height"]) if size else VIEWPORT
+        size = self.driver.page.viewport_size if self.driver.page else None
+        width, height = (size["width"], size["height"]) if size else VIEWPORT
         await show_frame(self.call, self.driver, image, width, height)
 
     # -- the end -----------------------------------------------------------------------
     async def close(self, outcome: Dict[str, Any]) -> Dict[str, Any]:
         memory = self.brain.memory
+        meter = self.brain.meter
         result: Dict[str, Any] = {
             "outcome": str(outcome.get("outcome") or "failed"),
             "summary": str(outcome.get("summary") or ""),
@@ -932,9 +1238,12 @@ class _Run:
             "approvals": list(self.approvals), "handoffs": self.handoffs,
             "downloads": list(self.downloads),
         }
+        self.live.set(status={"done": "done", "budget": "stopped", "stopped": "stopped",
+                              "stopped_by_person": "stopped"}.get(result["outcome"], "failed"),
+                      now=result["summary"][:200], next="")
         try:
             if self.driver.page is not None:
-                final = await self.driver.snapshot(marks=False)
+                final = await self.driver.snapshot(look=True)
                 result["final_url"] = final.url
                 result["file_ref"] = BrowseTool._save_image(self.call, final, "final")
                 if self.session_dirty:
@@ -945,6 +1254,13 @@ class _Run:
                     await self.save_notes(notes)
         except Exception:
             pass
+        result["figures"] = {"steps": self.steps, "model_calls": meter.calls, "model_ms": meter.ms,
+                             "browser_ms": self.browser_ms, "cards": self.cards,
+                             "repeats_refused": self.refused_repeats,
+                             "actions": len([a for a in memory.actions if a["action"] != "the person said"]),
+                             "elapsed_ms": round((time.monotonic() - self.live.began) * 1000)}
+        self._figures()
+        self.live.stop()
         try:
             await self.call.screen.close()
         except Exception:
@@ -972,6 +1288,6 @@ class _Run:
             parts.append(f"[{n}] {words!r}" if words else f"[{n}]")
         for key in ("text", "url", "option", "key", "direction", "question", "reason", "outcome",
                     "query", "filter", "id", "why"):
-            if action.get(key):
+            if action.get(key) and not (what == "login" and key == "text"):
                 parts.append(f"{key}={str(action[key])[:60]!r}")
         return " ".join(parts)

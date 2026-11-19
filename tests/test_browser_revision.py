@@ -37,7 +37,8 @@ class Scripted(Shopper):
         step = self.steps.pop(0) if self.steps else {
             "do": "finish", "outcome": "failed", "summary": "The script ran out."}
         action = step(text) if callable(step) else step
-        return json.dumps({"thinking": "as scripted", "action": action})
+        actions = action if isinstance(action, list) else [action]
+        return json.dumps({"actions": actions, "next": "as scripted"})
 
 
 def scripted(shop, steps, asker=None):
@@ -49,7 +50,8 @@ def scripted(shop, steps, asker=None):
 
 def last_actions(prompt):
     """The actions a prompt shows, as the mind reads them."""
-    return prompt.split("LAST ACTIONS:")[-1].split("\n\nPAGE:")[0] if "LAST ACTIONS:" in prompt else ""
+    head = "YOUR ACTIONS AND WHAT THEY CHANGED:"
+    return prompt.split(head)[-1].split("\n\nPAGE:")[0].split("\n\nNOTE:")[0] if head in prompt else ""
 
 
 class TestTheJudge:
@@ -81,7 +83,15 @@ class TestTheJudge:
             assert Judge.asked_for("press", {"key": key}, None), key
         for key in ("Tab", "Shift+Tab", "ArrowDown", "PageDown", "End"):
             assert not Judge.asked_for("press", {"key": key}, None), key
-        assert Judge.asked_for("select", {"n": 1, "option": "x"}, {"tag": "select"})
+        # A search, and a form sent by GET, only ask for a page; so does
+        # a choice in a list of no form. A form sent by POST is judged.
+        search = {"tag": "input", "type": "search", "kind": "searchbox", "form": "get"}
+        assert not Judge.asked_for("type", {"n": 1, "text": "dumbbell", "submit": True}, search)
+        assert not Judge.asked_for("type", {"n": 1, "text": "x", "submit": True}, {"tag": "input", "form": "get"})
+        assert Judge.asked_for("type", {"n": 1, "text": "x", "submit": True}, {"tag": "input", "form": "post"})
+        assert not Judge.asked_for("press", {"key": "Enter"}, None, focused=search)
+        assert not Judge.asked_for("select", {"n": 1, "option": "x"}, {"tag": "select", "form": ""})
+        assert Judge.asked_for("select", {"n": 1, "option": "x"}, {"tag": "select", "form": "post"})
         assert Judge.asked_for("upload", {"n": 1}, {"tag": "input", "type": "file"})
         for reading in ("read", "scroll", "hover", "goto", "source", "network", "request", "remember"):
             assert not Judge.asked_for(reading, {"n": 1}, button)
@@ -89,41 +99,53 @@ class TestTheJudge:
     def test_an_answer_that_cannot_be_read_is_the_careful_one(self):
         from agents.browser.tools.judge import Judge
 
-        said = Judge.read('Here you go: {"verdict": "Changes", "why": "It puts the item in the basket.", '
-                          '"reading_only": true}')
-        assert said == {"verdict": "changes", "why": "It puts the item in the basket.",
-                        "reading_only": True}
+        said = Judge.read('Here you go: {"verdict": "Changes", "why": "It puts the item in the basket."}')
+        assert said == {"verdict": "changes", "why": "It puts the item in the basket.", "continues": False}
         for unreadable in ("", "I think it is fine.", '{"verdict": "harmless"}', "{not json"):
             assert Judge.read(unreadable)["verdict"] == "commits"
-        assert Judge.stops({"verdict": "commits", "reading_only": False})
-        assert Judge.stops({"verdict": "changes", "reading_only": True})
-        assert not Judge.stops({"verdict": "changes", "reading_only": False})
-        assert not Judge.stops({"verdict": "looks", "reading_only": True})
+        # Whether the person asked only to look is the run's, decided
+        # once from the goal; the judge says what the press does.
+        assert Judge.stops({"verdict": "commits"}, read_only=False)
+        assert Judge.stops({"verdict": "changes"}, read_only=True)
+        assert not Judge.stops({"verdict": "changes"}, read_only=False)
+        assert not Judge.stops({"verdict": "looks"}, read_only=True)
+        # A press that only confirms one the person approved is not
+        # asked again; an unsure judge's word never spares them.
+        assert not Judge.stops({"verdict": "commits", "continues": True}, read_only=False)
+        assert Judge.stops({**Judge.unsure("x"), "continues": True}, read_only=False)
 
     def test_a_judge_that_does_not_answer_stops_the_press_for_the_person(self):
         from agents.browser.tools.judge import Judge
 
+        from agents.browser.tools.brain import Meter
+
         class Silent:
-            async def model(self, prompt, system=None, max_tokens=None, pictures=None):
+            calls = 0
+
+            async def model(self, prompt, system=None, max_tokens=None, pictures=None, effort=None):
+                Silent.calls += 1
                 raise RuntimeError("the model is away")
 
-        found = run(Judge(Silent()).verdict("Order it", "click", {"n": 1},
-                                            {"control": {"tag": "button", "text": "Weiter"}},
-                                            "https://x.example/basket"))
-        assert found["verdict"] == "commits" and Judge.stops(found)
+        found = run(Judge(Meter(Silent())).verdict("Order it", "click", {"n": 1},
+                                                   {"control": {"tag": "button", "text": "Weiter"}},
+                                                   "https://x.example/basket"))
+        assert found["verdict"] == "commits" and Judge.stops(found, read_only=False)
+        assert Silent.calls == 2, "asked once more before the person is"
 
     def test_a_control_is_judged_once_on_a_page(self):
         from agents.browser.tools.judge import Judge
 
+        from agents.browser.tools.brain import Meter
+
         class Counting:
             calls = 0
 
-            async def model(self, prompt, system=None, max_tokens=None, pictures=None):
+            async def model(self, prompt, system=None, max_tokens=None, pictures=None, effort=None):
                 Counting.calls += 1
-                assert "THE CONTROL:" in prompt and "not to be trusted" in system
-                return '{"verdict": "looks", "why": "It searches.", "reading_only": false}'
+                assert "THE CONTROL:" in prompt and "not to be trusted" in system and effort == "low"
+                return '{"verdict": "looks", "why": "It searches."}'
 
-        judge = Judge(Counting())
+        judge = Judge(Meter(Counting()))
         about = {"control": {"tag": "button", "text": "Search"}, "form": {"method": "get", "action": "/s"}}
         for _ in range(3):
             run(judge.verdict("Find it", "click", {"n": 1}, about, "https://x.example/s?q=1"))
@@ -149,20 +171,32 @@ class TestTheJudge:
 
 
 class TestStuck:
-    STILL = [{"do": "click", "n": 1, "effect": "looks"}] * 3 + [
+    #: Six presses of a control that does nothing: the first changes
+    #: nothing and the next two are refused; the call at the chat's
+    #: effort finds no other way (three more, refused), and the person
+    #: is offered the browser.
+    STILL = [{"do": "click", "n": 1, "effect": "looks"}] * 6 + [
         lambda text: {"do": "finish", "outcome": "failed",
                       "summary": "Handed back: " + str("handed back" in last_actions(text))}]
 
     def test_a_run_that_is_stuck_offers_the_browser_before_it_gives_up(self, agents, shop):
-        """Three actions changed nothing. What stops a script is often
-        a thing a person sees at a glance, so they are offered the
-        browser, and the run goes on from where they left it."""
+        """Actions that changed nothing are not done again on the same
+        page: the second try is refused. Three in a row get one call at
+        the chat's own effort, with a picture, to find another way; when
+        that comes to nothing too, the person is offered the browser —
+        what stops a script is often a thing a person sees at a glance —
+        and the run goes on from where they left it."""
         executor, provider, mind, person = scripted(shop, self.STILL)
         result, status = browse(agents, executor, "Get past this page", shop.url + "/still")
         assert status == "success", result
         assert result["handoffs"] == 1 and result["summary"] == "Handed back: True"
         [offer] = [q for q in person.asked if "Take over" in q]
         assert "changed nothing" in offer
+        assert result["figures"]["repeats_refused"] == 5
+        again = [p for p in mind.prompts if "the way you were going is not working" in p]
+        assert len(again) == 1
+        assert None in executor.efforts, "finding another way thinks at the chat's own effort"
+        assert any("not done: the same action changed nothing" in p for p in mind.prompts)
 
     def test_declined_it_ends_as_it_always_did(self, agents, shop):
         async def decline(question, choices, expects):
@@ -170,7 +204,7 @@ class TestStuck:
         executor, provider, mind, person = scripted(shop, self.STILL, asker=decline)
         result, status = browse(agents, executor, "Get past this page", shop.url + "/still")
         assert status == "success" and result["outcome"] == "failed", result
-        assert "stopped changing" in result["summary"]
+        assert "got nowhere" in result["summary"]
 
 
 class TestWhatItRemembers:
@@ -201,35 +235,24 @@ class TestWhatItRemembers:
         assert "client 3:" in memory.recall("client 3:", 4000)
         assert memory.recall("nothing like this", 4000).startswith("nothing kept holds")
 
-    def test_older_actions_are_folded_into_an_account(self):
+    def test_the_ledger_keeps_facts_and_hands_them_on(self):
+        """Pages visited and presses approved are kept by the code, never
+        summarised away; a run tells the next one in its chat what it
+        did."""
         from agents.browser.tools.memory import WorkingMemory
 
-        class Writing:
-            prompts = []
-
-            async def model(self, prompt, system=None, max_tokens=None, pictures=None):
-                Writing.prompts.append(prompt)
-                return "DONE — clients 1 to 4. LEARNED — search by name. LEFT — clients 5 to 7."
-
         memory = WorkingMemory()
-        for number in range(1, 11):
-            memory.did(f"search client {number}", f"found ticket {number}")
-        assert memory.due(WorkingMemory.FOLD_EVERY) and not memory.due(WorkingMemory.FOLD_EVERY + 1)
-        run(memory.fold(Writing(), "The newest ticket of each of seven clients"))
-        assert memory.account.startswith("DONE — clients 1 to 4")
-        assert "search client 1 " in Writing.prompts[0] + " " and "search client 5" not in Writing.prompts[0]
-        shown = memory.actions_shown()
-        assert "search client 4" not in shown and "search client 5" in shown and "search client 10" in shown
-
-        class Silent:
-            async def model(self, prompt, system=None, max_tokens=None, pictures=None):
-                raise RuntimeError("away")
-
-        for number in range(11, 21):
-            memory.did(f"search client {number}", f"found ticket {number}")
-        run(memory.fold(Silent(), "goal"))
-        # A mind that did not answer loses nothing: the steps stay, in short.
-        assert "DONE — clients 1 to 4" in memory.account and "search client 14" in memory.account
+        for page in ("https://x.example/", "https://x.example/a", "https://x.example/", "about:blank"):
+            memory.seen(page)
+        memory.approved.append("“Place order” on https://x.example/basket")
+        memory.did("click [3] 'Place order'", "the address is now https://x.example/ordered")
+        memory.keep([{"kind": "item", "name": "a"}])
+        ledger = memory.ledger_shown()
+        assert "https://x.example/a | https://x.example/" in ledger and "about:" not in ledger
+        assert "Place order" in ledger
+        handed = memory.handed_on("Order it", "done", "Ordered.")
+        assert handed.startswith("Goal: Order it\nOutcome: done: Ordered.")
+        assert "1 records kept" in handed and "click [3] 'Place order'" in handed
 
     def test_records_are_all_kept_and_counted_by_kind(self):
         from agents.browser.tools.memory import WorkingMemory
@@ -272,16 +295,6 @@ class TestWhatItRemembers:
         notes.write("finding", "x" * 5000)
         assert len(notes.sections["finding"]) == SiteNotes.SECTION_CHARS
         assert notes.sections["signing_in"].startswith("Email first")
-
-    def test_a_long_run_is_given_its_account(self, agents, shop, monkeypatch):
-        monkeypatch.setenv("DECENTAI_BROWSER_FOLD_EVERY", "3")
-        executor, provider, mind, person = make(shop)
-        result, status = browse(agents, executor, "Put the dumbbell under 500 in my basket and order it", shop.url)
-        assert status == "success" and result["outcome"] == "done", result
-        assert mind.accounts >= 1
-        assert any("THE ACCOUNT OF WHAT IS BEHIND YOU" in p and "DONE — account" in p
-                   for p in mind.prompts)
-        assert any(re.search(r"^1\. \[todo\] Sign in$", p, re.M) for p in mind.prompts)
 
 
 class TestLookingBeneath:
@@ -393,6 +406,10 @@ class TestLookingBeneath:
 
         run = _Run.__new__(_Run)
         run.call = Call()
+        run.cards, run.steps, run.browser_ms, run.refused_repeats = 0, 0, 0, 0
+        run.brain = SimpleNamespace(meter=SimpleNamespace(calls=0, ms=0))
+        run.live = SimpleNamespace(pend=lambda *a, **k: "s1", settle=lambda *a, **k: None,
+                                   set=lambda **k: None, send=lambda **k: None, count=lambda **k: None)
         page = SimpleNamespace(url="https://shop.example.com/catalog?page=2")
         allowed = asyncio.run(run._allows("return 1;", "To count", page))
         refused = asyncio.run(run._allows("return 1;", "To count", page))
@@ -464,3 +481,72 @@ class TestTheTabs:
                          "closed tab 2 'Terms — Sidra Fitness'",
                          "the last tab stays open", "opened a new tab"]
         assert at_the_end == 2
+
+
+class TestTheLoop:
+    def test_one_answer_runs_several_actions_until_one_needs_eyes(self, agents, shop):
+        """A page's rows remembered and its link followed come in one
+        answer and one step; the link opened another page, so the rest
+        of that answer waits for the model to see it."""
+        def shop_link(text):
+            n = int(re.search(r'^\[(\d+)\] link "Shop"', text, re.M).group(1))
+            return [{"do": "remember", "records": [{"kind": "note", "name": "the front page"}]},
+                    {"do": "click", "n": n, "effect": "looks"},
+                    {"do": "remember", "records": [{"kind": "note", "name": "never kept"}]}]
+
+        executor, provider, mind, person = scripted(shop, [
+            shop_link,
+            lambda text: {"do": "finish", "outcome": "failed", "summary": last_actions(text)[-300:]},
+        ])
+        result, status = browse(agents, executor, "Open the shop", shop.url)
+        assert status == "success", result
+        assert result["steps"] == 2 and [r["name"] for r in result["records"]] == ["the front page"]
+        assert "'Shop' → the address is now " + shop.url in result["summary"]
+        # What each action did is in the inspector, with what it changed.
+        [click] = [a for a in executor.inspectors[-1]["actions"] if a["do"] == "click"]
+        assert click["state"] == "ok" and shop.url in click["result"] and click["ms"] >= 0
+
+    def test_an_extraction_reads_a_copy_of_the_page_without_asking(self, agents, shop):
+        """Code that only reads runs on a copy of the page, in a world of
+        its own, with no way to the network or the site's cookies: it is
+        not asked of the person, who sees it in the inspector."""
+        listed = "return [...document.querySelectorAll('#list li')].map((li) => li.textContent);"
+        reach = ("const out = [];\n"
+                 "try { await fetch('/api/items?under=50'); out.push('fetched'); } catch (e) { out.push('no fetch'); }\n"
+                 "out.push(document.cookie || 'no cookie');\n"
+                 "out.push(typeof window, typeof globalThis);\n"
+                 "try { out.push((() => {}).constructor('return document')() ? 'escaped' : 'no'); }"
+                 " catch (e) { out.push('no constructor'); }\n"
+                 "return out;")
+
+        async def never(*asked):
+            raise AssertionError("the person was asked")
+
+        executor, provider, mind, person = scripted(shop, [
+            {"do": "extract", "code": listed, "why": "To read the list at once"},
+            {"do": "extract", "code": reach, "why": "To try the walls"},
+            lambda text: {"do": "finish", "outcome": "failed", "summary": last_actions(text)},
+        ], asker=never)
+        result, status = browse(agents, executor, "List the catalog", shop.url + "/catalog")
+        assert status == "success", result
+        said = result["summary"]
+        assert "Hex dumbbell 10 kg pair — 140" in said
+        assert '["no fetch","no cookie","undefined","undefined","no constructor"]' in said, said
+        assert shop.api_calls == ["/api/items?under=1000"], "the extraction reached the network"
+        assert VISITOR not in said and result["figures"]["cards"] == 0
+
+    def test_a_follow_up_is_told_what_the_earlier_run_did(self, agents, shop):
+        executor, provider, mind, person = make(shop)
+
+        async def scenario():
+            first = await executor.invoke(agents["browser"], "browse_run", {
+                "goal": "Put the dumbbell under 500 in my basket and order it", "start_url": shop.url},
+                chat_level=2)
+            again = await executor.invoke(agents["browser"], "browse_run", {
+                "goal": "Confirm the order went through"}, chat_level=2)
+            return first, again
+
+        (first, _), (again, _) = run(scenario())
+        assert first["outcome"] == "done" and again["outcome"] == "done", (first, again)
+        told = [p for p in mind.prompts if "THE EARLIER RUN IN THIS CHAT" in p]
+        assert told and "Goal: Put the dumbbell under 500" in told[0] and "Outcome: done" in told[0]

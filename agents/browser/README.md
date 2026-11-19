@@ -1,27 +1,63 @@
 # Browser
 
 A real web browser, driven by the chat's model, with no site-specific
-code. Given a goal and a page it looks, decides one action, acts, and
-looks again — up to a step budget — while the person watches it live in
-the chat and takes it over when a site wants a human.
+code. Given a goal and a page it reads the page, decides a few actions,
+runs them, sees what each one changed, and reads again — up to a step
+budget — while the person watches it live in the chat, with an
+inspector beside the page, and takes it over when a site wants a human.
 
-## What the model sees every step
+## What the model sees, and what it answers
 
-A screenshot of the page with a red numbered mark on every element it
-could act on; the same elements as text (number, kind, label, value,
-link); the page's readable words; its plan, with where each step of it
-stands; the account of what is behind it; the records it has kept; its
-newest actions and how they went; notes from earlier visits to the
-site. It writes its reasoning, never shown, and one action.
+The page as an **outline** of the whole document, in its order:
+headings, words, forms, dialogs, and every control a person could act
+on, numbered — `[12] button "Add to basket"`. A control keeps its
+number for as long as the page lives, so the history stays meaningful.
+Controls below the fold are in the outline too: the model acts on them
+without scrolling. A **picture** comes with the outline only when it
+helps: the first look at a page, a page the outline says little about
+(a canvas, a map), a frame a person could act in, or when the model
+asks (`look`).
 
-How much of each it is shown is a share of the step's prompt, not a
-count (`tools/memory.py`): the page's words take what the rest leaves.
-Everything is kept; the actions no longer shown are folded, every ten
-steps, into an account the model writes itself, and `recall` reads
-back what left its sight. Where something is cut, the cut is said,
-with how to get the rest. `DECENTAI_BROWSER_PROMPT_CHARS` (60,000) and
-`DECENTAI_BROWSER_FOLD_EVERY` (10) are the two numbers a deployment
-may change.
+Beside the page: the goal and whether the person asked only to look
+(decided once, from the goal alone, while the browser starts), the plan
+with where each step stands, the ledger (pages visited, presses the
+person approved), the records kept, every action with **what it
+changed** (a new address, a dialog, lines that came and went, or "no
+visible effect"), what the person said, the site's notes, and what an
+earlier run in the same chat did.
+
+The model answers with one JSON object: up to six **actions**, run in
+order; a few words on what it does **next** (the person reads them in
+the inspector); and its plan when the plan changed. It writes no
+reasoning into the answer: a step asks for low effort, and only finding
+another way, when stuck, asks for the chat's own.
+
+How much of each part it is shown is a share of the step's prompt
+(`tools/memory.py`); everything is kept by the code and nothing is
+summarised by the model. Where something is cut, the cut is said, with
+how to get the rest (`recall`, `read`). `DECENTAI_BROWSER_PROMPT_CHARS`
+(48,000) is the number a deployment may change.
+
+## Not doing the same thing twice
+
+The actions of one answer run until one needs the model's eyes: it
+failed, it changed nothing, it opened another page, a tab or a dialog,
+or it read something the model must see. An action that changed nothing
+is not done again on the same page: the second try is refused, and the
+model is told. Three actions in a row that changed nothing, or a run
+going in circles, get one call at the chat's own effort, with a
+picture, to find another way. When that comes to nothing too, the
+person is offered the browser, once for a page, before the run gives
+up.
+
+## Waiting for the page
+
+After an action the driver waits for what the action causes, not for a
+fixed time: a new page to load when one is on its way, then the page to
+stop changing for 120 ms, never longer than about a second. A page
+whose analytics never fall silent is not waited on. Fields are filled at
+once; a search box or a list that suggests as one types is typed key by
+key.
 
 ## Beneath the picture
 
@@ -36,21 +72,49 @@ words (`tools/inspector.py`).
 | `response` | What came back for one of them, when it is data or text | Free; not while a sign-in is on the page, nor for what was fetched while the person held the browser |
 | `console` | What the page logged, and its errors | Free |
 | `request` | An address of the page's own site, fetched with the page's session | GET only, the same site only |
-| `script` | JavaScript, run in the page | The person's approval every time, asked in the chat with the reason and the code whole. 600 characters at most |
+| `extract` | JavaScript that only reads, run on a copy of the page | Not asked: see below |
+| `script` | JavaScript, run in the live page | The person's approval every time, asked in the chat with the reason and the code whole. 600 characters at most |
+
+An **extraction** runs in a script world of its own, which the page's
+scripts cannot reach. Its `document` is a copy of the page. It has no
+`window`, `fetch`, `XMLHttpRequest`, `WebSocket`, storage or cookies, and
+it cannot make code of its own (the function constructors are taken
+away). The page's own requests are held while it runs. The live page is
+watched meanwhile: if it changes — by the code reaching past its copy,
+or by the page itself, which cannot be told apart — that is reported,
+and every later extraction in the run is asked of the person like a
+script. Each extraction shows in the inspector's Pending list while it
+runs.
 
 Cookies, stored values and headers are never shown: they are the
 person's session, not the page's content.
 
-The model's replies are never capped in tokens: a reply is one JSON
-object and the model stops when it is done. A reply that cannot be
-read as an action is told back with why — cut off, or not one JSON
-object — and three such replies in a row end the run.
+## The inspector
+
+Beside the page, the live view has a tab that cannot be closed:
+
+- what the agent does now and plans next;
+- the plan;
+- what is about to happen: a script, an extraction, a press waiting for
+  approval, a request, a sign-in;
+- each action with what it changed and how long it took (and the model
+  time it cost);
+- the page's requests, the agent's own marked apart, and those the
+  address policy refused;
+- the console;
+- the run's figures: steps, model calls and time, browser time, cards
+  asked, repeats refused.
+
+It is sent as the call's `inspector` note, whole each time (the newest
+replaces the one before), at most a few times a second. Its shape is
+the `inspector` event's, version 1 (`tools/live.py`). It holds no
+control: approvals stay on the platform's cards.
 
 ## Functions
 
 | Function | Level | What it does |
 |---|---|---|
-| `browse_run` | 2 | Does what the goal says from `start_url`, up to `max_steps` (60 by default, 200 at most). Without `start_url` it continues on the page the chat's browser was left at. `files` are what the person attached for a page to take (`upload`). Returns the outcome (`done`, `stopped`, `stopped_by_person` when the user answered Stop, `failed`, `budget`), a summary, the records found, the steps taken, the final URL, a screenshot's `file_ref`, what was approved, how many handoffs, and any downloads, each returned to the chat as a file |
+| `browse_run` | 1 | Does what the goal says from `start_url`, up to `max_steps` (60 by default, 200 at most). Without `start_url` it continues on the page the chat's browser was left at. `files` are what the person attached for a page to take (`upload`). Returns the outcome (`done`, `stopped`, `stopped_by_person` when the user answered Stop, `failed`, `budget`), a summary, the records found, the steps taken, the final URL, a screenshot's `file_ref`, what was approved, how many handoffs, any downloads (each returned to the chat as a file), and the run's figures |
 | `browse_watch` | 0 | Shows the chat's browser in the live view before anything is asked of it, so the person can look, sign in or go somewhere; the model calls it when the person wants to see or use the browser, not as a step in a task. `action: quit` closes the browser and remembers where it was |
 | `browse_screenshot` | 2 | Opens a page and returns a screenshot as a file, with its title and final URL |
 
@@ -73,25 +137,30 @@ stops using it.
   by the words on the page, which are in any language. A code is asked
   each time and never stored. The values reach the page and nothing
   else: not the model's prompt, not the history.
-- **A press that cannot be taken back.** Before a button is pressed, a
-  form sent, a choice made in a list or a file put in, a second model
-  call — the judge (`tools/judge.py`) — is shown the control, its form
-  and the screen around it, and says what the press does: it looks,
-  it changes something the person can take back, or it commits. One
-  that commits stops for the person's approval (asked in the chat), and so
-  does any change when they asked only to look. An answer the judge
-  did not give, or that cannot be read, is one that commits. A plain
-  link is followed unjudged — a read, by the protocol's rule — unless
-  the model itself expects more of it. No list of words decides any of
-  this, so it holds in every language. Only the agent's own question
-  approves a press: a question the model asked on its own does not.
+- **A press that cannot be taken back.** Before a button is pressed or
+  a form sent by POST, a second model call — the judge
+  (`tools/judge.py`) — is shown the control, its form and the screen
+  around it, and says what the press does: it looks, it changes
+  something the person can take back, or it commits. One that commits
+  stops for the person's approval (asked in the chat), and so does any
+  change when they asked only to look. A judge that cannot be read is
+  asked once more; then its answer is one that commits. A plain link,
+  a search box, a form sent by GET and a choice in a list of no form are
+  reads and are not judged. No list of words decides any of this, so it
+  holds in every language. Only the agent's own question approves a
+  press: a question the model asked on its own does not. The same press
+  approved once may be allowed for the rest of the run when it comes
+  again (the third "Add to basket"); and a press that only confirms one
+  the person just approved on the same site ("Confirm order" after
+  "Place order") is not asked again.
 - **A page that wants a human.** A CAPTCHA, an approval on the person's
   phone, a sign-in a script may not do: the model sees it and hands the
   browser over, the agent feeds the person's hand to the page, and
-  continues when they press Done. A run whose last three actions
-  changed nothing offers the browser too, once for a page, before it
+  continues when they press Done. A run that got nowhere, and found
+  no other way, offers the browser too, once for a page, before it
   gives up.
-- **A script.** See above: theirs to allow, each time.
+- **A script.** See above: theirs to allow, each time. An extraction is
+  not, unless one was seen to change the page.
 - **The tabs.** A page a click opened in a new tab comes to the front.
   Every frame tells of the open tabs, the live view shows them, and the
   person goes to one, closes one or opens one — which takes the
