@@ -2,11 +2,12 @@ schema: 3
 agent:
   id: browser
   name: Browser
-  version: "1.0.0"
+  version: "2.0.0"
   description: >
     Drives a real web browser to do what you ask on any site — the sites nothing else covers: prefer a dedicated agent when
     one is installed for the site. Find things, fill forms, put items in a basket, read what a page says. You watch it in
-    the chat and can take over when a site wants a human. Logins are asked for once and saved as your secrets; paying, ordering,
+    the chat, with an inspector beside the page showing what it does, what the page fetches and what it plans next, and
+    can take over when a site wants a human. Logins are asked for once and saved as your secrets; paying, ordering,
     sending or deleting always stops for your approval.
   instructions: >
     Use this agent when the user wants something done on a website that no other agent covers, or wants a page read as a
@@ -75,8 +76,9 @@ functions:
       the user's saved secrets; a press that cannot be taken back stops for approval, as does a script the agent wants to
       run in the page. Hand it in files what the user attached for a page to take (an upload). Returns the outcome (done,
       stopped, stopped_by_person when the user answered Stop, failed, budget), a summary, the records found, the steps
-      taken, the final URL, a screenshot's file_ref, and the files it downloaded.
-    level: 2
+      taken, the final URL, a screenshot's file_ref, the files it downloaded, and the run's figures (model calls and
+      time, browser time, cards asked).
+    level: 1
     timeout_seconds: 1800
     calls:
       - model
@@ -114,6 +116,7 @@ functions:
         handoffs: {type: integer}
         file_ref: {type: string}
         downloads: {type: array, items: {type: object}}
+        figures: {type: object}
   - id: browse_watch
     name: Watch
     description: >

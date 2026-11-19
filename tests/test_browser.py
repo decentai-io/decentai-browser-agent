@@ -62,21 +62,18 @@ class Shopper:
         self.prompts.append(text)
         if pictures:
             self.pictures += len(pictures)
-        if text.startswith("The person asked:"):
-            return '["Sign in", "Open the shop", "Add the dumbbell under 500", "Check the basket", "Confirm"]'
+        if text.startswith("The person asked a browser agent:"):
+            return json.dumps({"read_only": self.reading_only})
         if text.startswith("The goal was:"):
             return '{"done": true, "summary": "The basket shows the 20 kg dumbbell and the order is placed."}'
         if text.startswith("You just finished a run"):
             return "Sign in at /login; the shop lists dumbbells with Add buttons; Place order is on /basket."
         if text.startswith("THE PERSON ASKED:"):
             return self.judge(text)
-        if text.startswith("You are partway through a task"):
-            self.accounts += 1
-            return f"DONE — account {self.accounts}. LEARNED — the shop. LEFT — the rest."
         page = re.search(r"PAGE: .* — (\S+)", text)
         url = page.group(1) if page else ""
         marks = {m.group(2): int(m.group(1))
-                 for m in re.finditer(r"^\[(\d+)\] [^:]+: '([^']*)'", text, re.M)}
+                 for m in re.finditer(r'^\[(\d+)\] [^"\n]*"([^"]*)"', text, re.M)}
 
         def mark(word):
             return next((n for label, n in marks.items() if word.lower() in label.lower()), None)
@@ -87,7 +84,7 @@ class Shopper:
         if mark("Use your password instead"):
             return (f'{{"thinking": "no passkey here; the page offers the password", "action": '
                     f'{{"do": "click", "n": {mark("Use your password instead")}, "effect": "looks"}}}}')
-        if url.endswith("/login") or "input password" in text:
+        if url.endswith("/login") or "textbox(password)" in text:
             return ('{"thinking": "a login form", "action": {"do": "login", '
                     f'"username": {mark("Email") or 1}, "password": {marks.get("", 2) if False else mark("Password") or 2}, '
                     f'"submit": {mark("Sign in") or 3}}}}}')
@@ -211,7 +208,7 @@ class TestPasskey:
                 await driver.start()
                 # By name: a passkey is never asked of a bare address.
                 await driver.goto(shop.url.replace("127.0.0.1", "localhost") + "/passkey")
-                await driver.page.wait_for_selector("text=Use your password instead", timeout=3000)
+                await driver.page.wait_for_selector("text=Use your password instead", timeout=15000)
                 available = await driver.page.evaluate(
                     "PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()")
                 return await driver.read(), available
@@ -235,8 +232,8 @@ class SignerIn(Shopper):
 
     async def __call__(self, messages, max_tokens=None, pictures=None):
         text = messages[-1]["text"]
-        page = text.split("ELEMENTS (number, kind, text):")[-1]
-        inputs = re.findall(r"^\[(\d+)\] input (\w+)[^:]*: '([^']*)'", page, re.M)
+        page = text.split("OUTLINE:")[-1]
+        inputs = re.findall(r'^\[(\d+)\] (textbox)[^"\n]*"([^"]*)"', page, re.M)
         if inputs and text.startswith("GOAL:"):
             self.prompts.append(text)
             fields = []
@@ -350,14 +347,14 @@ class TestAPageOnItsWay:
                 self.fails, self.reads = fails, 0
 
             async def evaluate(self, script, *args):
-                if "dai-marks" in script and not args:
-                    return None  # taking the marks down
+                if "MutationObserver" in script:
+                    return 0  # waiting for the page to be quiet
                 self.reads += 1
                 if self.reads <= self.fails:
                     raise RuntimeError("Execution context was destroyed, "
                                        "most likely because of a navigation")
                 return {"elements": [{"n": 1, "tag": "input", "type": "password"}],
-                        "text": "Password", "frames": [], "scroll": [0, 0, 800]}
+                        "outline": '[1] textbox(password) "Password"', "frames": [], "scroll": [0, 0, 800]}
 
             async def screenshot(self, **_):
                 return b"jpeg"
@@ -394,19 +391,20 @@ class TestAnUnreadableAnswer:
             cut = True
 
         class Mind:
-            async def model(self, prompt, system=None, max_tokens=None, pictures=None):
-                assert max_tokens is None
-                return Cut('{"thinking": "record all three jobs", "action": {"do": "remem')
+            async def model(self, prompt, system=None, max_tokens=None, pictures=None, effort=None):
+                assert max_tokens is None and effort == "low"
+                return Cut('{"actions": [{"do": "remem')
 
         class Call:
             model = Mind().model
 
         class Page:
             url, title, text, image, elements, tabs, scroll = "https://x.example/", "", "", b"", [], [], (0, 0, 0)
+            outline, cut, more = "", False, 0
 
-        decision = run(Brain(Call()).decide("goal", Page(), 1, 10, 0))
-        assert decision["action"]["do"] == "invalid" and decision["action"]["cut"] is True
-        assert _Run._line(decision["action"], Page()) == "the model's answer was cut off before it ended"
+        [action] = run(Brain(Call()).decide("goal", Page(), 1, 10, []))["actions"]
+        assert action["do"] == "invalid" and action["cut"] is True
+        assert _Run._line(action, Page()) == "the model's answer was cut off before it ended"
         assert _Run._line({"do": "invalid"}, Page()) == "the model's answer could not be read"
 
     def test_three_unreadable_answers_end_the_run(self, agents, shop):
@@ -474,10 +472,19 @@ class TestShopping:
         assert ("Place order", "commits") in mind.judged
         assert not any(words == "Shop" for words, _ in mind.judged)
         assert shop.orders == [["d20"]]
-        # What was found came back as a record, and the model saw pictures.
+        # What was found came back as a record. The model read the
+        # outline, with a picture only at a page's first look.
         assert [r["name"] for r in result["records"]] == [
             "Adjustable dumbbell 20 kg", "Adjustable dumbbell 30 kg", "Flat dumbbell 15 kg"]
-        assert mind.pictures >= result["steps"]
+        assert 1 <= mind.pictures < result["steps"]
+        # The steps asked for little thought; the run's figures and the
+        # inspector came back with it.
+        assert "low" in executor.efforts
+        assert result["figures"]["steps"] == result["steps"] and result["figures"]["model_calls"] >= result["steps"]
+        assert result["figures"]["cards"] == 2
+        assert executor.inspectors and executor.inspectors[-1]["status"] == "done"
+        assert any(a["do"] == "click" for a in executor.inspectors[-1]["actions"])
+        assert any(n["url"].endswith("/basket") for n in executor.inspectors[-1]["network"])
         assert result["final_url"].endswith("/ordered") and result["file_ref"] in executor.files
         # ...and as a table in the chat.
         [table] = [said["table"] for said in executor.said if "table" in said]
@@ -707,7 +714,7 @@ class TestShopping:
         assert result["handoffs"] == 0 and not any("Take over" in q for q in person.asked)
         assert shop.logins == [ACCOUNT]
         assert any("click" in a and "Use your password instead" in a
-                   for p in mind.prompts for a in re.findall(r"^- (.*)$", p, re.M))
+                   for p in mind.prompts for a in re.findall(r"^\d+\. (.*)$", p, re.M))
 
     def test_the_person_steers_in_words_and_takes_the_browser_mid_run(self, agents, shop):
         """Words sent while the run works reach the model at its next
