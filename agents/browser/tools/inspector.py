@@ -25,10 +25,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
 
 from .policy import same_site
+
+#: Code that only reads, run in a world of its own on a copy of the
+#: page (extract.js).
+EXTRACT_JS = Path(__file__).with_name("extract.js").read_text(encoding="utf-8")
 
 #: The element, or the page, as HTML a reader can use: what draws and
 #: what runs is taken out, a field's value is never in it (a hidden
@@ -114,6 +121,7 @@ class InspectError(Exception):
 class Inspector:
     #: How much of what happened is kept to be asked about.
     FETCHED_KEPT = 400
+    HISTORY_KEPT = 200
     LOGGED_KEPT = 200
     #: A script longer than this is not run: the person must be able to
     #: read what they allow.
@@ -134,6 +142,14 @@ class Inspector:
         #: a sign-in is on the page, or the person holds the browser:
         #: what is fetched now is listed, never opened
         self.guarded = False
+        #: when each request the page made left, to time its answer
+        self._left: Dict[Any, float] = {}
+        #: the addresses the agent itself asked for (request), to tell
+        #: them apart from the page's own
+        self._agent_asks: List[str] = []
+        #: what every page of the run fetched, as the person's inspector
+        #: shows it: not begun again when a page goes elsewhere
+        self.history: List[Dict[str, Any]] = []
 
     # -- what is recorded, as it happens ---------------------------------------
     def watch(self, page) -> None:
@@ -146,6 +162,10 @@ class Inspector:
         self.fetched = [f for f in self.fetched if f["page"] is not page]
         self.logged = [entry for entry in self.logged if entry["page"] is not page]
 
+    @staticmethod
+    def _now() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     def _asked(self, page, request) -> None:
         # A page that goes somewhere else begins again: what is kept is
         # what this page fetched, since it opened.
@@ -154,25 +174,51 @@ class Inspector:
                 self.forget(page)
         except Exception:
             pass
+        self._left[request] = time.monotonic()
+        if len(self._left) > 2 * self.FETCHED_KEPT:
+            for old in list(self._left)[:self.FETCHED_KEPT]:
+                self._left.pop(old, None)
+
+    def refused(self, request, why: str) -> None:
+        """A request the address policy refused before it left: listed, with why."""
+        try:
+            self._count += 1
+            self.fetched.append({
+                "id": self._count, "page": self.driver.page, "method": request.method, "address": request.url,
+                "status": 0, "kind": request.resource_type, "type": "", "size": 0, "guarded": True,
+                "response": None, "at": self._now(), "ms": 0, "by": "page", "blocked": str(why)[:200]})
+            self.history.append(self.fetched[-1])
+            del self.fetched[:-self.FETCHED_KEPT]
+            del self.history[:-self.HISTORY_KEPT]
+        except Exception:
+            pass
 
     def _answered(self, page, response) -> None:
         try:
             request = response.request
             headers = response.headers
             self._count += 1
+            left = self._left.pop(request, None)
+            by = "page"
+            if response.url in self._agent_asks:
+                self._agent_asks.remove(response.url)
+                by = "agent"
             self.fetched.append({
                 "id": self._count, "page": page, "method": request.method, "address": response.url,
                 "status": response.status, "kind": request.resource_type,
                 "type": str(headers.get("content-type") or "").split(";")[0].strip(),
                 "size": int(headers.get("content-length") or 0),
-                "guarded": self.guarded, "response": response,
+                "guarded": self.guarded, "response": response, "at": self._now(),
+                "ms": round((time.monotonic() - left) * 1000) if left else 0, "by": by, "blocked": "",
             })
+            self.history.append(self.fetched[-1])
             del self.fetched[:-self.FETCHED_KEPT]
+            del self.history[:-self.HISTORY_KEPT]
         except Exception:
             pass
 
     def _logged(self, page, kind: str, text: str) -> None:
-        self.logged.append({"page": page, "kind": str(kind), "text": str(text)[:600]})
+        self.logged.append({"page": page, "kind": str(kind), "text": str(text)[:600], "at": self._now()})
         del self.logged[:-self.LOGGED_KEPT]
 
     # -- what is handed over ---------------------------------------------------------
@@ -199,6 +245,8 @@ class Inspector:
         if entry["guarded"] or (self.guarded and entry["page"] is self.driver.page):
             raise InspectError("what was fetched while a sign-in was on the page, or while the "
                                "person held the browser, is not opened")
+        if entry.get("response") is None:
+            raise InspectError(f"it was refused before it left: {entry.get('blocked') or 'the address policy'}")
         if not any(mark in entry["type"] for mark in self.READABLE):
             raise InspectError(f"it is {entry['type'] or 'of no stated kind'}, which is not read as words")
         try:
@@ -233,12 +281,55 @@ class Inspector:
         why = self.driver.policy.refusal(target)
         if why:
             raise InspectError(f"{target} cannot be read: {why}")
+        self._agent_asks.append(target)
+        del self._agent_asks[:-20]
         try:
             return dict(await asyncio.wait_for(page.evaluate(FETCH_JS, target), self.REQUEST_SECONDS))
         except asyncio.TimeoutError:
             raise InspectError(f"{target} did not answer in {self.REQUEST_SECONDS} seconds")
         except Exception as exc:
             raise InspectError(f"{target} could not be read: {self._short(exc)}")
+
+    async def extract(self, code: str) -> Dict[str, Any]:
+        """Code that only reads, run in a world of its own on a copy of
+        the page (extract.js), with the page's requests held while it
+        runs. What it returned, why it failed, and ``touched``: changes
+        to the real page while it ran — by the code reaching past its
+        copy, or by the page itself, which cannot be told apart, so
+        either counts."""
+        page = self.driver.page
+        session = None
+        self.driver.held = asyncio.Event()
+        self.driver.held_asks = 0
+        try:
+            session = await page.context.new_cdp_session(page)
+            tree = await session.send("Page.getFrameTree")
+            world = await session.send("Page.createIsolatedWorld", {
+                "frameId": tree["frameTree"]["frame"]["id"], "worldName": f"dai-extract-{time.monotonic_ns()}",
+                "grantUniveralAccess": False})
+            found = await asyncio.wait_for(session.send("Runtime.callFunctionOn", {
+                "functionDeclaration": EXTRACT_JS, "executionContextId": world["executionContextId"],
+                "arguments": [{"value": str(code)}], "awaitPromise": True, "returnByValue": True}),
+                self.SCRIPT_SECONDS)
+        except asyncio.TimeoutError:
+            raise InspectError(f"the extraction did not end in {self.SCRIPT_SECONDS} seconds")
+        except Exception as exc:
+            raise InspectError(f"the extraction could not run: {self._short(exc)}")
+        finally:
+            self.driver.held.set()
+            self.driver.held = None
+            if session is not None:
+                try:
+                    await session.detach()
+                except Exception:
+                    pass
+        if found.get("exceptionDetails"):
+            detail = found["exceptionDetails"]
+            raise InspectError("the extraction failed: " + str(
+                (detail.get("exception") or {}).get("description") or detail.get("text") or "")[:300])
+        value = (found.get("result") or {}).get("value") or {}
+        return {"answer": str(value.get("answer") or "null"), "failed": str(value.get("failed") or ""),
+                "touched": int(value.get("touched") or 0)}
 
     async def script(self, code: str) -> str:
         """JavaScript, run in the page, and what it returned as JSON.
@@ -262,6 +353,13 @@ class Inspector:
         as a picture — or None when there is no such control. With no
         mark, the field the keyboard is in."""
         page = self.driver.page
+        if n:
+            # The outline numbers controls out of view too: the picture
+            # around one is taken where a person would see it.
+            try:
+                await page.locator(f'[data-dai-mark="{int(n)}"]').first.scroll_into_view_if_needed(timeout=2000)
+            except Exception:
+                pass
         try:
             found = await page.evaluate(ABOUT_JS, int(n or 0))
         except Exception:
