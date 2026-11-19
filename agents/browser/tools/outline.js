@@ -46,6 +46,18 @@
       el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('alt') || (img ? img.alt : '') ||
       el.getAttribute('name') || '';
   };
+  // What a framework made clickable without saying so — a click handler
+  // on a span, no role, no href — shows only as a pointer cursor. The
+  // outermost such element, with no control inside it, is listed as a
+  // button: an arrow that opens a tree, a card that opens an item.
+  const clickable = (el) => {
+    if (getComputedStyle(el).cursor !== 'pointer') return false;
+    const parent = el.parentElement;
+    if (parent && getComputedStyle(parent).cursor === 'pointer') return false;
+    if (el.querySelector(CONTROL)) return false;
+    const box = el.getBoundingClientRect();
+    return box.width >= 4 && box.height >= 4 && box.width * box.height <= 250000;
+  };
   const elements = [], lines = [];
   let used = 0, more = 0, full = false, text = '';
   const say = (line) => {
@@ -86,6 +98,12 @@
       ? (label || item.text) : (item.text || label);
     let line = '[' + n + '] ' + role + (type === 'password' ? '(password)' : '');
     if (named) line += ' "' + cut(named, 80) + '"';
+    else if (el.parentElement) {
+      // An icon with no words of its own — a tree's arrow, a close cross —
+      // is named by the words beside it.
+      const near = words(el.parentElement.innerText || '');
+      if (near) line += ' near "' + cut(near, 60) + '"';
+    }
     if (item.value && tag !== 'select') line += ' value="' + item.value + '"';
     if (tag === 'select') {
       const chosen = el.selectedOptions && el.selectedOptions[0] ? words(el.selectedOptions[0].text) : '';
@@ -115,6 +133,7 @@
       if (SKIPPED.has(tag) || el.id === 'dai-marks') continue;
       if (!shown(el)) continue;
       if (el.matches(CONTROL)) { flush(); control(el); continue; }
+      if (clickable(el)) { flush(); control(el); continue; }
       const role = el.getAttribute('role') || '';
       if (/^h[1-6]$/.test(tag) || role === 'heading') {
         flush();
