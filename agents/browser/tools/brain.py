@@ -233,7 +233,7 @@ class Brain:
         picture."""
         text = self._situation(goal, snapshot, step, max_steps, notes, again)
         picture = [snapshot.image] if snapshot.image else None
-        answer = await self.meter.ask(text, system=SYSTEM, pictures=picture,
+        answer = await self.meter.ask(text, system=self.system(goal), pictures=picture,
                                       effort=None if again else STEP_EFFORT)
         parsed = self._json(answer)
         if isinstance(parsed, dict) and isinstance(parsed.get("action"), dict) and not parsed.get("actions"):
@@ -242,29 +242,28 @@ class Brain:
                    if isinstance(a, dict) and a.get("do")]
         if not actions:
             # An answer that is not one JSON object with actions. The
-            # platform says when the provider cut the reply short: that
-            # is told back, so the model answers with less.
+            # platform says when the provider cut the reply short, and
+            # when it refused to answer at all (its content filter): each
+            # is told back as what it is.
             return {"actions": [{"do": "invalid", "cut": bool(getattr(answer, "cut", False)),
+                                 "refused": bool(getattr(answer, "refused", False)),
                                  "raw": str(answer)[:300]}], "next": ""}
         if isinstance(parsed.get("plan"), list) and parsed["plan"]:
             self.plan.take(parsed["plan"])
         self.next = " ".join(str(parsed.get("next") or "").split())[:200]
         return {"actions": actions[:ACTIONS_MAX], "next": self.next}
 
-    def _situation(self, goal: str, snapshot, step: int, max_steps: int, notes: List[str],
-                   again: bool) -> str:
+    def system(self, goal: str) -> str:
+        """The instructions, then what stays the same for the whole run — the goal, whether to only look, what
+        an earlier run did, the files, the site's notes — as one text: the part of every step's prompt a provider
+        caches. What changes from step to step comes after it, in the step's own words."""
         memory = self.memory
-        lines = [f"GOAL: {goal}",
+        lines = [SYSTEM, "THIS RUN", f"GOAL: {goal}",
                  "MODE: " + ("the person asked only to look: change nothing" if self.read_only
-                             else "you may change things the goal needs; what commits is asked of the person"),
-                 f"STEP {step} of at most {max_steps}."]
-        if not self.plan.steps:
-            lines.append("PLAN: none yet — give one with this answer.")
-        else:
-            lines.append("PLAN:\n" + self.plan.shown())
+                             else "you may change things the goal needs; what commits is asked of the person")]
         if self.continuing:
             lines.append(f"You continue in the browser an earlier run of this conversation left open, at "
-                         f"{self.continuing}: what is on the page is where things stand.")
+                         f"{self.continuing}.")
         if memory.earlier:
             lines.append("THE EARLIER RUN IN THIS CHAT:\n" + cut(memory.earlier, memory.share("earlier")))
         if self.files:
@@ -272,6 +271,16 @@ class Brain:
         site = self.notes.text()
         if site:
             lines.append("SITE NOTES (from earlier visits):\n" + cut(site, memory.share("notes")))
+        return "\n\n".join(lines)
+
+    def _situation(self, goal: str, snapshot, step: int, max_steps: int, notes: List[str],
+                   again: bool) -> str:
+        memory = self.memory
+        lines = [f"STEP {step} of at most {max_steps}. The goal is under THIS RUN."]
+        if not self.plan.steps:
+            lines.append("PLAN: none yet — give one with this answer.")
+        else:
+            lines.append("PLAN:\n" + self.plan.shown())
         ledger = memory.ledger_shown()
         if ledger:
             lines.append("LEDGER:\n" + ledger)

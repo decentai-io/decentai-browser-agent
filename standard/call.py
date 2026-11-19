@@ -14,6 +14,21 @@ from .agent import ResourceDenied
 PICTURES = {b"\x89PNG": "png", b"\xff\xd8\xff": "jpg", b"GIF8": "gif", b"RIFF": "webp"}
 
 
+class Said(str):
+    """The model's words, with why it stopped: ``stop`` is end, length (``cut``: max_tokens cut it) or refusal
+    (``refused``: the provider refused to answer, its content filter say, and there are no words)."""
+
+    stop = "end"
+
+    @property
+    def cut(self) -> bool:
+        return self.stop == "length"
+
+    @property
+    def refused(self) -> bool:
+        return self.stop == "refusal"
+
+
 class Call:
     def __init__(self, program: Any, call_id: str, function: str, inputs: dict[str, Any]):
         self.program, self.id, self.function, self.inputs = program, call_id, function, inputs
@@ -38,7 +53,10 @@ class Call:
         paths = [self.written(f"picture.{self.kind(p)}", p) if isinstance(p, bytes) else str(p) for p in pictures or []]
         inputs = {"messages": messages, **({"max_tokens": max_tokens} if max_tokens else {}),
                   **({"pictures": paths} if paths else {}), **({"effort": effort} if effort else {})}
-        return str((await self.runtime("model", inputs, paths))["text"] or "")
+        answer = await self.runtime("model", inputs, paths)
+        said = Said(str(answer.get("text") or ""))
+        said.stop = str(answer.get("stop") or "end")
+        return said
 
     async def say(self, text: str = "", table: dict[str, Any] | None = None,
                   chart: dict[str, Any] | None = None) -> None:

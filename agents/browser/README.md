@@ -16,9 +16,10 @@ Controls below the fold are in the outline too: the model acts on them
 without scrolling. A control a framework drew without saying so (a
 click handler on a span, no role, no link) is known by its pointer
 cursor, and an icon with no words is named by the words beside it. A **picture** comes with the outline only when it
-helps: the first look at a page, a page the outline says little about
-(a canvas, a map), a frame a person could act in, or when the model
-asks (`look`).
+helps: the run's first look, a page the outline says little about (a
+canvas, a map), a frame a person could act in, or when the model asks
+(`look`). A step with a picture is never served from the provider's
+cache, so the outline carries the rest.
 
 Beside the page: the goal and whether the person asked only to look
 (decided once, from the goal alone, while the browser starts), the plan
@@ -32,7 +33,12 @@ The model answers with one JSON object: up to six **actions**, run in
 order; a few words on what it does **next** (the person reads them in
 the inspector); and its plan when the plan changed. It writes no
 reasoning into the answer: a step asks for low effort, and only finding
-another way, when stuck, asks for the chat's own.
+another way, when stuck, asks for the chat's own. What stays the same for
+the whole run — the instructions, the goal, whether to only look, the
+earlier run, the site's notes — is sent as the system text, the part a
+provider caches; the plan, the ledger, the actions and the page follow
+in the step's own text. A provider that refuses to answer (its content
+filter) is said as that, and two refusals in a row end the run.
 
 How much of each part it is shown is a share of the step's prompt
 (`tools/memory.py`); everything is kept by the code and nothing is
@@ -56,8 +62,9 @@ up.
 
 After an action the driver waits for what the action causes, not for a
 fixed time: a new page to load when one is on its way, then the page to
-stop changing for 120 ms, never longer than about a second. A page
-whose analytics never fall silent is not waited on. Fields are filled at
+stop changing for 120 ms: 0.7 seconds at most, 1.2 after a new page.
+Only changes to what the page holds count, not attributes alone, so an
+ad's animation or a carousel is not waited on. Fields are filled at
 once; a search box or a list that suggests as one types is typed key by
 key.
 
@@ -122,8 +129,10 @@ control: approvals stay on the platform's cards.
 
 A process serves one chat, so it holds one browser: it stays open after
 a run, and a follow-up in the same chat continues where the last run
-stopped. It goes with the process, which the runtime ends once the chat
-stops using it.
+stopped. Chromium is most of a process's memory, so a browser nobody
+has used for three minutes (`DECENTAI_BROWSER_IDLE_SECONDS`, 180) is
+closed; where it was and what the last run did are kept, and the next
+run opens a browser there, signed in by the site's session.
 
 ## The moments that are the person's
 

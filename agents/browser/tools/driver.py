@@ -59,7 +59,7 @@ TABS_FRESH_SECONDS = 1.0
 READ_ATTEMPTS = 3
 #: How long a page may keep changing after an action before it is read
 #: anyway, and how long a new page may take to load, in milliseconds.
-QUIET_MS = 1200
+QUIET_MS = 700
 LOAD_MS = 10000
 
 #: The whole page as an outline, in document order. Each control keeps
@@ -69,14 +69,16 @@ LOAD_MS = 10000
 #: page is scrolled.
 OUTLINE_JS = Path(__file__).with_name("outline.js").read_text(encoding="utf-8")
 
-#: Resolves once the page has not changed for 120 ms, or after ``max``
-#: milliseconds, whichever comes first: how long it took.
+#: Resolves once the page's content has not changed for 120 ms, or after
+#: ``max`` milliseconds, whichever comes first: how long it took. Changes
+#: to attributes alone are not waited on: an ad's animation or a
+#: carousel's class turns over for ever and moves nothing a model reads.
 QUIET_JS = r"""
 (max) => new Promise((resolve) => {
   const start = performance.now();
   let last = start;
   const watch = new MutationObserver(() => { last = performance.now(); });
-  watch.observe(document, {subtree: true, childList: true, attributes: true, characterData: true});
+  watch.observe(document, {subtree: true, childList: true, characterData: true});
   const tick = () => {
     const now = performance.now();
     if (now - last >= 120 || now - start >= max) { watch.disconnect(); resolve(Math.round(now - start)); }
@@ -397,6 +399,8 @@ class Driver:
                 await self.page.wait_for_load_state("domcontentloaded", timeout=LOAD_MS)
             except Exception:
                 pass
+            # A new page draws itself after it loads: given a little longer.
+            most_ms = max(most_ms, 1200)
         await self.quiet(most_ms)
 
     def _marks(self) -> Tuple[int, int]:

@@ -31,12 +31,14 @@ class Scripted(Shopper):
 
     async def __call__(self, messages, max_tokens=None, pictures=None):
         text = messages[-1]["text"]
-        if not text.startswith("GOAL:"):
+        if not text.startswith("STEP "):
             return await super().__call__(messages, max_tokens=max_tokens, pictures=pictures)
-        self.prompts.append(text)
+        self.prompts.append("\n\n".join(m["text"] for m in messages))
         step = self.steps.pop(0) if self.steps else {
             "do": "finish", "outcome": "failed", "summary": "The script ran out."}
         action = step(text) if callable(step) else step
+        if isinstance(action, tuple):
+            return action  # the provider's own answer: words and why it stopped
         actions = action if isinstance(action, list) else [action]
         return json.dumps({"actions": actions, "next": "as scripted"})
 
@@ -331,7 +333,9 @@ class TestLookingBeneath:
         assert result["records"] == [{"kind": "item", "name": "Hex dumbbell 10 kg pair",
                                       "price": 140, "known_visitor": True}]
         assert shop.api_calls == ["/api/items?under=1000", "/api/items?under=200"]
-        seen = "\n".join(mind.prompts)
+        # What the run showed of the page, without the instructions every call carries.
+        from agents.browser.tools.brain import SYSTEM
+        seen = "\n".join(p.replace(SYSTEM, "") for p in mind.prompts)
         assert "Adjustable dumbbell 30 kg" in seen          # the first answer, opened
         assert "is not of the site the page is on" in seen  # another site is not read
         assert "catalog: 3 items drawn" in seen             # the console
@@ -572,3 +576,47 @@ class TestTheLoop:
         assert status == "success", result
         assert '"Downloads"' in result["summary"], result["summary"]
         assert result["figures"]["cards"] == 0
+
+    def test_a_providers_refusal_ends_the_run_said_as_that(self, agents, shop):
+        """The provider refused to answer about a page (its content filter) and the run read the empty answer
+        as one it could not read, three times, and said so. Two refusals in a row end it, saying what happened."""
+        executor, provider, mind, person = scripted(shop, [("", "refusal"), ("", "refusal"), ("", "refusal")])
+        result, status = browse(agents, executor, "Read the catalog", shop.url + "/catalog")
+        assert status == "success" and result["outcome"] == "failed", result
+        assert "refused to answer" in result["summary"] and result["steps"] == 2
+
+    def test_a_finish_whose_evidence_is_on_the_page_is_not_checked_again(self, agents, shop):
+        executor, provider, mind, person = scripted(shop, [
+            {"do": "finish", "outcome": "done", "summary": "Saw the page.", "evidence": "Nothing moves here"}])
+        result, status = browse(agents, executor, "Read the heading", shop.url + "/still")
+        assert status == "success" and result["outcome"] == "done" and result["summary"] == "Saw the page."
+        assert not any(p.startswith("The goal was:") for p in mind.prompts)
+        assert result["figures"]["model_calls"] == 3  # the look-only check, the step, the site notes
+
+    def test_a_browser_nobody_uses_is_closed_and_where_it_was_kept(self, monkeypatch):
+        from agents.browser.tools import browse_tool
+
+        class Driver:
+            stopped = False
+
+            class page:
+                url = "https://shop.example/basket"
+
+            async def stop(self):
+                Driver.stopped = True
+
+        async def scenario():
+            monkeypatch.setattr(browse_tool, "IDLE_CLOSE_SECONDS", 0.05)
+            browser = browse_tool.Browser()
+            kept = browser.keep(Driver())
+            kept.last = "Goal: order it"
+            browser.idle()
+            assert browser.get() is kept, "a call in time keeps it"
+            browser.idle()
+            await asyncio.sleep(0.2)
+            return browser
+
+        browser = run(scenario())
+        assert Driver.stopped and browser.kept is None
+        assert browser.was == "https://shop.example/basket" and browser.last == "Goal: order it"
+
