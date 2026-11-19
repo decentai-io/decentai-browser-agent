@@ -13,7 +13,9 @@ headings, words, forms, dialogs, and every control a person could act
 on, numbered — `[12] button "Add to basket"`. A control keeps its
 number for as long as the page lives, so the history stays meaningful.
 Controls below the fold are in the outline too: the model acts on them
-without scrolling. A **picture** comes with the outline only when it
+without scrolling. A control a framework drew without saying so (a
+click handler on a span, no role, no link) is known by its pointer
+cursor, and an icon with no words is named by the words beside it. A **picture** comes with the outline only when it
 helps: the first look at a page, a page the outline says little about
 (a canvas, a map), a frame a person could act in, or when the model
 asks (`look`).

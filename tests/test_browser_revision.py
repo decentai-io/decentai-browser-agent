@@ -550,3 +550,25 @@ class TestTheLoop:
         assert first["outcome"] == "done" and again["outcome"] == "done", (first, again)
         told = [p for p in mind.prompts if "THE EARLIER RUN IN THIS CHAT" in p]
         assert told and "Goal: Put the dumbbell under 500" in told[0] and "Outcome: done" in told[0]
+
+    def test_a_control_known_only_by_its_pointer_is_in_the_outline(self, agents, shop):
+        """A tree's arrow drawn as a span with a click handler has no
+        role and no link: 2.0.0 left it out of the outline, and the run
+        asked the person to allow a script that opened the tree. The
+        outermost element with a pointer cursor is a control, named by
+        the words beside it when it has none."""
+        def open_home(text):
+            n = int(re.search(r'^\[(\d+)\] button near "Home"', text, re.M).group(1))
+            return {"do": "click", "n": n, "effect": "looks"}
+
+        async def never(*asked):
+            raise AssertionError("the person was asked")
+
+        executor, provider, mind, person = scripted(shop, [
+            open_home,
+            lambda text: {"do": "finish", "outcome": "failed", "summary": text.split("OUTLINE:")[-1]},
+        ], asker=never)
+        result, status = browse(agents, executor, "Open the Home folder", shop.url + "/tree")
+        assert status == "success", result
+        assert '"Downloads"' in result["summary"], result["summary"]
+        assert result["figures"]["cards"] == 0

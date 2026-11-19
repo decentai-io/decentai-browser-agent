@@ -106,6 +106,8 @@ class ShopSite:
                     return self._send(PAGE_TERMS)
                 if path == "/still":
                     return self._send(PAGE_STILL)
+                if path == "/tree":
+                    return self._send(PAGE_TREE)
                 if path == "/login":
                     if site.passkey_first:
                         site.passkey_first = False
@@ -223,6 +225,23 @@ fetch('/api/items?under=1000').then(function (answer) { return answer.json(); })
 PAGE_TERMS = """<!doctype html><html><head><title>Terms — Sidra Fitness</title></head><body>
 <h1>Terms</h1>
 <p>Goods may be returned within fourteen days.</p>
+</body></html>"""
+
+# A tree as a framework draws one: the arrow that opens a branch is an
+# empty span with a click handler, no role and no link — known only by
+# its pointer cursor.
+PAGE_TREE = """<!doctype html><html><head><title>Tree — Sidra Fitness</title>
+<style>.arrow { display: inline-block; width: 14px; height: 14px; cursor: pointer; background: #888; }</style>
+</head><body>
+<h1>Folders</h1>
+<ul><li><span class="arrow"></span> <span class="title">Home</span>
+  <ul class="branch" hidden><li><label><input type="checkbox" name="downloads"> Downloads</label></li></ul>
+</li></ul>
+<script>
+document.querySelector('.arrow').addEventListener('click', function () {
+  document.querySelector('.branch').hidden = false;
+});
+</script>
 </body></html>"""
 
 # A page where nothing a script does changes anything.
