@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -30,12 +31,13 @@ class Call:
         self.program.send("note", {"call": self.id, "progress": str(text)[:1000]})
 
     async def model(self, prompt: str, system: str | None = None, max_tokens: int | None = None,
-                    pictures: list[bytes | str] | None = None) -> str:
-        """The chat's model: its text. Pictures are paths in the home, or bytes written there."""
+                    pictures: list[bytes | str] | None = None, effort: str | None = None) -> str:
+        """The chat's model: its text. Pictures are paths in the home, or bytes written there. ``effort`` (low, medium,
+        high) is how hard the model thinks on this call alone; none is the chat's own."""
         messages = ([{"role": "system", "text": system}] if system else []) + [{"role": "user", "text": prompt}]
         paths = [self.written(f"picture.{self.kind(p)}", p) if isinstance(p, bytes) else str(p) for p in pictures or []]
         inputs = {"messages": messages, **({"max_tokens": max_tokens} if max_tokens else {}),
-                  **({"pictures": paths} if paths else {})}
+                  **({"pictures": paths} if paths else {}), **({"effort": effort} if effort else {})}
         return str((await self.runtime("model", inputs, paths))["text"] or "")
 
     async def say(self, text: str = "", table: dict[str, Any] | None = None,
@@ -149,6 +151,7 @@ class Screen:
 
     MOST = 300 * 1024
     TABS_MOST = 20
+    INSPECTOR_MOST = 120 * 1024
 
     def __init__(self, call: Call):
         self.call = call
@@ -169,6 +172,18 @@ class Screen:
         self.open = True
         self.call.program.send("note", {"call": self.call.id, "screen": {
             "image": encoded, "width": int(width), "height": int(height), "tabs": told}})
+        return True
+
+    def inspect(self, state: dict[str, Any]) -> bool:
+        """What the call shows of its own working beside its screen (``note`` with ``inspector``): an object of at
+        most 128 KiB as JSON, passing like a screen; False when it is larger."""
+        try:
+            size = len(json.dumps(state, ensure_ascii=False, default=str))
+        except (TypeError, ValueError):
+            return False
+        if size > self.INSPECTOR_MOST:
+            return False
+        self.call.program.send("note", {"call": self.call.id, "inspector": state})
         return True
 
     async def close(self) -> None:

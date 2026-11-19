@@ -1,13 +1,19 @@
 """The hand and the eyes: Playwright driving Chromium.
 
 One page at a time in one browser context, with tabs. ``snapshot``
-gives the model what a person sees — a screenshot with a numbered mark
-on every element it could act on, the same elements as text, the
-page's words — and what the guards need: whether a password field is
-on the page, whether the page wants a human. Actions name elements by
-their mark. ``frame`` is the plain picture for the live view, and
+gives the model the page as an outline of the whole document, in its
+order: headings, words, and every control it could act on, each with a
+number that stays the same for as long as the page does — so "clicked
+[12] 'Add to basket'" still means that button three steps later. A
+picture is taken only when one is asked for: the outline is what the
+model reads. ``frame`` is the plain picture for the live view, and
 ``dispatch`` feeds the person's own hand to the page when they take
 over.
+
+After an action the driver waits for what the action causes, not for a
+fixed time: a new page to load when one is on its way, then the page to
+stop changing (QUIET_JS), never longer than a short cap. A page whose
+analytics never fall silent is not waited on for seconds.
 
 Nothing here talks to the platform; the tool does that.
 """
@@ -17,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -37,103 +44,50 @@ if CARRIED.is_dir():
                       FONTCONFIG_FILE=str(CARRIED / "fonts.conf"))
 
 VIEWPORT = (1280, 800)
-#: What is read of the page's words, and of one element. How much of it
-#: the model is shown is the memory's budget to say, not a number here.
+#: What is read of the page's words, and of one element.
 TEXT_CHARS = 40000
 READ_CHARS = 40000
-#: How many elements are marked on one picture: more, and the numbers
-#: cover the page they label. The rest are counted, and said.
-MARKS_MAX = 150
+#: The outline's limits: controls numbered, and characters in all. Past
+#: either, the outline says how much more there is and how to read it.
+CONTROLS_MAX = 400
+OUTLINE_CHARS = 24000
 #: How many tabs are told of, and how often their names are read again.
 TABS_MAX = 20
 TABS_FRESH_SECONDS = 1.0
-#: How long a click is given to open its new tab, if it opens one.
-NEW_TAB_SECONDS = 0.25
 #: Reads of a page before it is shown as unreadable: one being replaced
 #: by the next (a redirect after a form) is waited for and read again.
 READ_ATTEMPTS = 3
+#: How long a page may keep changing after an action before it is read
+#: anyway, and how long a new page may take to load, in milliseconds.
+QUIET_MS = 1200
+LOAD_MS = 10000
 
-#: Finds what a person could act on in the viewport, numbers it, and
-#: draws the number on it. Returns the elements as data; the marks stay
-#: on the elements (a data attribute) so an action can find them, and
-#: the drawn labels are removed after the screenshot.
-MARK_JS = r"""
-(limit) => {
-  const old = document.getElementById('dai-marks');
-  if (old) old.remove();
-  document.querySelectorAll('[data-dai-mark]').forEach(e => e.removeAttribute('data-dai-mark'));
-  const selector = 'a[href], button, input:not([type=hidden]), select, textarea, summary, ' +
-    '[role=button], [role=link], [role=checkbox], [role=radio], [role=tab], [role=menuitem], ' +
-    '[role=option], [role=combobox], [role=switch], [role=textbox], [contenteditable=true], [onclick]';
-  const vw = window.innerWidth, vh = window.innerHeight;
-  const seen = new Set();
-  const out = [];
-  let more = 0;
-  const layer = document.createElement('div');
-  layer.id = 'dai-marks';
-  layer.style.cssText = 'position:fixed;left:0;top:0;width:0;height:0;z-index:2147483647;pointer-events:none;';
-  let n = 0;
-  for (const el of document.querySelectorAll(selector)) {
-    if (seen.has(el)) continue;
-    const style = getComputedStyle(el);
-    if (style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) continue;
-    const box = el.getBoundingClientRect();
-    if (box.width < 2 || box.height < 2) continue;
-    if (box.bottom < 0 || box.right < 0 || box.top > vh || box.left > vw) continue;
-    seen.add(el);
-    if (out.length >= limit) { more += 1; continue; }
-    n += 1;
-    el.setAttribute('data-dai-mark', String(n));
-    const tag = el.tagName.toLowerCase();
-    const text = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ');
-    // What a person reads beside the field comes before what the form
-    // calls it inside: its label, then its hints, then its own name.
-    const labelled = (el.id ? document.querySelector('label[for="' + CSS.escape(el.id) + '"]') : null) ||
-      (tag === 'input' || tag === 'select' || tag === 'textarea' ? el.closest('label') : null);
-    const label = el.getAttribute('aria-label') || (labelled ? labelled.innerText.trim() : '') ||
-      el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('alt') ||
-      el.getAttribute('name') || '';
-    out.push({
-      n, tag, role: el.getAttribute('role') || '',
-      type: tag === 'input' ? (el.getAttribute('type') || 'text') : '',
-      text: text.slice(0, 80),
-      label: label.replace(/\s+/g, ' ').slice(0, 80),
-      value: (tag === 'input' || tag === 'textarea' || tag === 'select') ? String(el.value || '').slice(0, 80) : '',
-      href: tag === 'a' ? String(el.getAttribute('href') || '').slice(0, 160) : '',
-      // What the form itself says a field is for: its own name and the
-      // standard autocomplete token, in whatever language the page is.
-      name: String(el.getAttribute('name') || el.id || '').slice(0, 60),
-      autocomplete: String(el.getAttribute('autocomplete') || '').toLowerCase().slice(0, 40),
-      checked: (el.type === 'checkbox' || el.type === 'radio') ? !!el.checked : undefined,
-      disabled: !!el.disabled,
-      box: [Math.round(box.left), Math.round(box.top), Math.round(box.width), Math.round(box.height)],
-    });
-    const tag_ = document.createElement('div');
-    tag_.textContent = String(n);
-    tag_.style.cssText = 'position:fixed;left:' + Math.max(0, box.left) + 'px;top:' + Math.max(0, box.top - 14) +
-      'px;background:#d6336c;color:#fff;font:bold 11px/14px system-ui,sans-serif;padding:0 4px;border-radius:3px;' +
-      'box-shadow:0 0 0 1px #fff;';
-    layer.appendChild(tag_);
-    const outline = document.createElement('div');
-    outline.style.cssText = 'position:fixed;left:' + box.left + 'px;top:' + box.top + 'px;width:' + box.width +
-      'px;height:' + box.height + 'px;outline:2px solid #d6336c;outline-offset:-1px;';
-    layer.appendChild(outline);
-  }
-  document.body.appendChild(layer);
-  // Only frames a person could see and act in: an invisible captcha
-  // frame (a login page's silent risk check, a v3 badge parked off the
-  // edge) is not a human check, and stopping for it hands the person a
-  // page with nothing to solve.
-  const frames = Array.from(document.querySelectorAll('iframe')).filter(f => {
-    const r = f.getBoundingClientRect(); const s = getComputedStyle(f);
-    return r.width >= 200 && r.height >= 60 && s.display !== 'none' && s.visibility !== 'hidden'
-      && s.opacity !== '0' && r.right <= window.innerWidth + 1 && r.left >= -1;
-  }).map(f => f.getAttribute('src') || '').filter(Boolean);
-  return { elements: out, more, text: (document.body.innerText || '').slice(0, 40000), frames,
-           scroll: [Math.round(window.scrollY), Math.round(document.documentElement.scrollHeight), vh] };
-}
+#: The whole page as an outline, in document order. Each control keeps
+#: its number (``data-dai-mark``) for as long as the document lives; a
+#: new document numbers from 1 again. Returns the controls as data, the
+#: outline as text, the visible frames (for a human check) and where the
+#: page is scrolled.
+OUTLINE_JS = Path(__file__).with_name("outline.js").read_text(encoding="utf-8")
+
+#: Resolves once the page has not changed for 120 ms, or after ``max``
+#: milliseconds, whichever comes first: how long it took.
+QUIET_JS = r"""
+(max) => new Promise((resolve) => {
+  const start = performance.now();
+  let last = start;
+  const watch = new MutationObserver(() => { last = performance.now(); });
+  watch.observe(document, {subtree: true, childList: true, attributes: true, characterData: true});
+  const tick = () => {
+    const now = performance.now();
+    if (now - last >= 120 || now - start >= max) { watch.disconnect(); resolve(Math.round(now - start)); }
+    else setTimeout(tick, 30);
+  };
+  setTimeout(tick, 40);
+})
 """
-UNMARK_JS = "() => { const l = document.getElementById('dai-marks'); if (l) l.remove(); }"
+
+#: A control's number, as an outline line begins with it.
+LINE_MARK = re.compile(r"^\[\d+\] ")
 
 
 @dataclass
@@ -141,6 +95,9 @@ class Snapshot:
     url: str
     title: str
     elements: List[Dict[str, Any]]
+    #: the page as the model reads it: headings, words and numbered controls
+    outline: str
+    #: the page's plain words, for reading and verifying
     text: str
     frames: List[str]
     image: bytes
@@ -148,22 +105,57 @@ class Snapshot:
     height: int
     scroll: Tuple[int, int, int] = (0, 0, 0)
     tabs: List[str] = field(default_factory=list)
-    #: elements in view that were not marked, past MARKS_MAX
+    #: controls past CONTROLS_MAX, not numbered
     more: int = 0
+    #: whether the outline stopped at OUTLINE_CHARS
+    cut: bool = False
 
     @property
     def signature(self) -> str:
-        """What 'the page did not change' is judged by."""
+        """What 'the page did not change' is judged by: its address and
+        its outline, with values. Not where it is scrolled: scrolling a
+        page that holds no more is no change."""
         digest = hashlib.sha1()
         digest.update(self.url.encode("utf-8"))
-        digest.update(str(self.scroll[0]).encode("utf-8"))
-        for element in self.elements:
-            digest.update(f"{element.get('tag')}|{element.get('text')}|{element.get('value')}".encode("utf-8"))
-        digest.update(self.text[:2000].encode("utf-8"))
+        digest.update(self.outline.encode("utf-8"))
         return digest.hexdigest()
 
     def element(self, n: int) -> Optional[Dict[str, Any]]:
         return next((e for e in self.elements if int(e.get("n") or 0) == int(n)), None)
+
+    def lines(self) -> List[str]:
+        return [line for line in self.outline.splitlines() if line.strip()]
+
+
+def changes(before: Optional[Snapshot], after: Snapshot) -> Dict[str, Any]:
+    """What an action changed, as the next look sees it: a new address or
+    title, a dialog that opened or closed, the lines that came and went.
+    ``moved`` is false when nothing the outline holds changed."""
+    if before is None:
+        return {"moved": True, "said": ""}
+    said: List[str] = []
+    if after.url != before.url:
+        said.append(f"the address is now {after.url[:200]}")
+    elif after.title != before.title:
+        said.append(f"the title is now {after.title[:100]!r}")
+    if len(after.tabs) != len(before.tabs):
+        said.append(f"{len(after.tabs)} tabs are open")
+    was, now = before.lines(), after.lines()
+    gone_set, came_set = set(was) - set(now), set(now) - set(was)
+    came = [line for line in now if line in came_set]
+    gone = [line for line in was if line in gone_set]
+    if any(line.startswith("== dialog") for line in came):
+        said.append("a dialog opened")
+    if any(line.startswith("== dialog") for line in gone):
+        said.append("a dialog closed")
+    if after.url == before.url and (came or gone):
+        shown = "; ".join(line[:90] for line in came[:4])
+        said.append(f"{len(came)} lines came" + (f" ({shown}{'; …' if len(came) > 4 else ''})" if came else "")
+                    + (f", {len(gone)} went" if gone else ""))
+    if after.scroll[0] != before.scroll[0]:
+        said.append(f"scrolled to {after.scroll[0]} of {after.scroll[1]}")
+    moved = after.signature != before.signature or len(after.tabs) != len(before.tabs)
+    return {"moved": moved, "said": "; ".join(said) if said else "no visible effect"}
 
 
 class DriverError(Exception):
@@ -172,6 +164,10 @@ class DriverError(Exception):
 
 class Driver:
     """One browser, one context, the page in front."""
+
+    #: The browser's own user agent, without the word that names a
+    #: headless build: read once a process, from its version.
+    _agent = ""
 
     def __init__(self, headless: bool = True):
         self.headless = headless
@@ -191,6 +187,12 @@ class Driver:
         self._tabs_changed = 0
         self._tabs_as_of = -1
         self._adopted: List[Any] = []
+        #: counts the page in front going to a new document
+        self._navigated = 0
+        #: while set, what the page asks of the network waits (an
+        #: extraction runs, which may read and never send)
+        self.held: Optional[asyncio.Event] = None
+        self.held_asks = 0
 
     # -- life --------------------------------------------------------------
     async def start(self, storage_state: Optional[Dict[str, Any]] = None) -> None:
@@ -230,7 +232,7 @@ class Driver:
             storage_state=storage_state or None,
             accept_downloads=True,
             locale="en-US",
-            user_agent=await self._plain_user_agent(),
+            user_agent=self._plain_user_agent(),
         )
         self._context.set_default_timeout(8000)
         await self._context.add_init_script(self.PLAIN_JS)
@@ -283,25 +285,39 @@ class Driver:
         })();
     """
 
-    async def _plain_user_agent(self) -> str:
-        """The browser's own user agent with the word that names a
-        headless build taken out: what the same Chromium says when it
-        has a window."""
-        try:
-            probe = await self._browser.new_context()
-            page = await probe.new_page()
-            agent = str(await page.evaluate("navigator.userAgent") or "")
-            await probe.close()
-        except Exception:
-            return ""
-        return agent.replace("HeadlessChrome", "Chrome")
+    def _plain_user_agent(self) -> str:
+        """What this Chromium says when it has a window, from its
+        version: a desktop Chrome on Linux. No page is opened to ask
+        it, which once cost a browser context at every start."""
+        if not Driver._agent:
+            try:
+                version = str(self._browser.version).split()[0]
+            except Exception:
+                return ""
+            Driver._agent = (f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                             f"Chrome/{version} Safari/537.36")
+        return Driver._agent
 
     async def _gate(self, route, request) -> None:
         why = self.policy.refusal(request.url)
         if why:
+            self.inspector.refused(request, why)
             await route.abort("blockedbyclient")
-        else:
+            return
+        held = self.held
+        if held is not None and not held.is_set():
+            # An extraction is reading the page: what the page asks of
+            # the network waits until it is done, so nothing it read
+            # can leave while it reads.
+            self.held_asks += 1
+            try:
+                await asyncio.wait_for(held.wait(), 25)
+            except asyncio.TimeoutError:
+                pass
+        try:
             await route.continue_()
+        except Exception:
+            pass
 
     def _on_download(self, download) -> None:
         self.downloads.append({"download": download, "filename": download.suggested_filename})
@@ -318,7 +334,15 @@ class Driver:
         self._adopted.append(page)
         page.on("download", self._on_download)
         page.on("close", self._left)
+        page.on("framenavigated", lambda frame, page=page: self._went(page, frame))
         self.inspector.watch(page)
+
+    def _went(self, page, frame) -> None:
+        try:
+            if frame is page.main_frame:
+                self._navigated += 1
+        except Exception:
+            pass
 
     def _left(self, page) -> None:
         if page in self._adopted:
@@ -346,30 +370,47 @@ class Driver:
     async def storage_state(self) -> Dict[str, Any]:
         return await self._context.storage_state() if self._context else {}
 
-    # -- eyes --------------------------------------------------------------
+    # -- waiting -------------------------------------------------------------
+    async def quiet(self, most_ms: int = QUIET_MS) -> None:
+        """Until the page in front stops changing, or ``most_ms``."""
+        try:
+            await asyncio.wait_for(self.page.evaluate(QUIET_JS, int(most_ms)), most_ms / 1000 + 2)
+        except Exception:
+            pass
+
     async def settle(self, seconds: float = 2.0) -> None:
+        """A page that is loading, loaded; then quiet."""
         try:
-            await self.page.wait_for_load_state("domcontentloaded", timeout=8000)
+            await self.page.wait_for_load_state("domcontentloaded", timeout=LOAD_MS)
         except Exception:
             pass
-        try:
-            await self.page.wait_for_load_state("networkidle", timeout=int(seconds * 1000))
-        except Exception:
-            pass
+        await self.quiet(int(seconds * 1000))
 
-    async def _read(self, page, marks: bool) -> Dict[str, Any]:
-        if marks:
-            return await page.evaluate(MARK_JS, MARKS_MAX)
-        return {"elements": [], "text": await page.evaluate("() => document.body ? document.body.innerText : ''"),
-                "frames": [], "scroll": [0, 0, VIEWPORT[1]]}
+    async def _after(self, navigated: int, tabs: int, most_ms: int = QUIET_MS) -> None:
+        """After an action: a page it opened, in this tab or a new one,
+        loaded; then the page in front quiet. A click that goes
+        somewhere starts its navigation a moment after it lands, so the
+        first quiet is short and the navigation is looked for again."""
+        await self.quiet(150)
+        if self._navigated != navigated or self._tabs_changed != tabs:
+            try:
+                await self.page.wait_for_load_state("domcontentloaded", timeout=LOAD_MS)
+            except Exception:
+                pass
+        await self.quiet(most_ms)
 
-    async def snapshot(self, marks: bool = True) -> Snapshot:
-        """The page as the model sees it: marked picture, elements, words."""
+    def _marks(self) -> Tuple[int, int]:
+        return self._navigated, self._tabs_changed
+
+    # -- eyes --------------------------------------------------------------
+    async def snapshot(self, look: bool = False) -> Snapshot:
+        """The page as the model reads it: its outline, its controls and,
+        when ``look``, a picture."""
         page = self.page
         found = None
         for attempt in range(READ_ATTEMPTS):
             try:
-                found = await self._read(page, marks)
+                found = await page.evaluate(OUTLINE_JS, {"controls": CONTROLS_MAX, "chars": OUTLINE_CHARS})
                 break
             except Exception as exc:
                 # A form sent a moment ago may still be on its way to
@@ -379,32 +420,37 @@ class Driver:
                 if attempt + 1 < READ_ATTEMPTS:
                     await self.settle(1.0)
                     continue
-                found = {"elements": [], "text": f"(the page could not be read: {exc})",
+                found = {"elements": [], "outline": f"(the page could not be read: {self._short(exc)})",
                          "frames": [], "scroll": [0, 0, VIEWPORT[1]]}
-        try:
-            image = await page.screenshot(type="jpeg", quality=65)
-        except Exception:
-            image = b""
-        if marks:
+        image = b""
+        if look:
             try:
-                await page.evaluate(UNMARK_JS)
+                image = await page.screenshot(type="jpeg", quality=55)
             except Exception:
-                pass
+                image = b""
         tabs = []
         for other in (self._context.pages if self._context else []):
             try:
                 tabs.append(f"{'* ' if other is page else ''}{await other.title() or other.url}")
             except Exception:
                 pass
+        outline = str(found.get("outline") or "")
         return Snapshot(
             url=page.url, title=await self._title(),
             elements=list(found.get("elements") or []),
-            text=str(found.get("text") or "")[:TEXT_CHARS],
+            outline=outline, text=LINE_MARK.sub("", outline),
             frames=list(found.get("frames") or []),
             image=image, width=VIEWPORT[0], height=VIEWPORT[1],
             scroll=tuple(found.get("scroll") or (0, 0, VIEWPORT[1])),
-            tabs=tabs, more=int(found.get("more") or 0),
+            tabs=tabs, more=int(found.get("more") or 0), cut=bool(found.get("cut")),
         )
+
+    async def picture(self) -> bytes:
+        """The page in front as the model sees it in a picture."""
+        try:
+            return await self.page.screenshot(type="jpeg", quality=55)
+        except Exception:
+            return b""
 
     #: What the live view accepts for one frame (the standard's 300 KB
     #: of base64, with room), and the qualities tried to fit a
@@ -467,7 +513,7 @@ class Driver:
             and answer.status in (403, 502) else ""
         if refused:
             raise DriverError(f"{url} cannot be visited: {refused}.")
-        await self.settle()
+        await self.quiet(1500)
 
     #: How Chromium says a page failed that the way out may have refused.
     REFUSED_FAILURES = ("ERR_TUNNEL_CONNECTION_FAILED", "ERR_HTTP_RESPONSE_CODE_FAILURE")
@@ -495,32 +541,38 @@ class Driver:
             await self.page.go_back(wait_until="domcontentloaded", timeout=10000)
         except Exception as exc:
             raise DriverError(f"could not go back: {self._short(exc)}")
-        await self.settle()
+        await self.quiet()
 
     async def click(self, n: int) -> None:
         target = self._locator(n)
+        marks = self._marks()
         try:
             await target.scroll_into_view_if_needed(timeout=3000)
             await target.click(timeout=5000)
         except Exception as exc:
             raise DriverError(f"element {n} could not be clicked: {self._short(exc)}")
-        # A page the click opened in a new tab arrives a moment after
-        # it: waited for, so what is looked at next is what was opened.
-        await asyncio.sleep(NEW_TAB_SECONDS)
-        await self.settle(1.5)
+        await self._after(*marks)
 
-    async def type(self, n: int, text: str, submit: bool = False) -> None:
+    #: Fields where a page listens to each key (suggestions as one
+    #: types): typed key by key. Every other field is filled at once.
+    KEYED = ("combobox", "searchbox")
+
+    async def type(self, n: int, text: str, submit: bool = False, keyed: bool = False) -> None:
         target = self._locator(n)
+        marks = self._marks()
         try:
             await target.scroll_into_view_if_needed(timeout=3000)
-            await target.click(timeout=5000)
-            await target.fill("", timeout=3000)
-            await target.type(str(text), delay=25, timeout=30000)
+            if keyed:
+                await target.click(timeout=5000)
+                await target.fill("", timeout=3000)
+                await target.press_sequentially(str(text), delay=8, timeout=30000)
+            else:
+                await target.fill(str(text), timeout=5000)
             if submit:
                 await target.press("Enter")
         except Exception as exc:
             raise DriverError(f"could not type into element {n}: {self._short(exc)}")
-        await self.settle(1.0)
+        await self._after(*marks, most_ms=800 if not submit else QUIET_MS)
 
     async def fill(self, n: int, text: str) -> None:
         """Set a field's value at once — for a login, where pacing buys nothing."""
@@ -532,6 +584,7 @@ class Driver:
 
     async def select(self, n: int, option: str) -> None:
         target = self._locator(n)
+        marks = self._marks()
         try:
             try:
                 await target.select_option(label=str(option), timeout=5000)
@@ -539,29 +592,32 @@ class Driver:
                 await target.select_option(value=str(option), timeout=5000)
         except Exception as exc:
             raise DriverError(f"could not choose {option!r} in element {n}: {self._short(exc)}")
-        await self.settle(1.0)
+        await self._after(*marks)
 
     async def press(self, key: str) -> None:
+        marks = self._marks()
         try:
             await self.page.keyboard.press(str(key))
         except Exception as exc:
             raise DriverError(f"could not press {key!r}: {self._short(exc)}")
-        await self.settle(1.0)
+        await self._after(*marks)
 
-    async def scroll(self, direction: str = "down", amount: int = 600) -> None:
+    async def scroll(self, direction: str = "down", amount: int = 700) -> None:
         delta = int(amount) if direction == "down" else -int(amount)
         try:
             await self.page.mouse.wheel(0, delta)
-            await asyncio.sleep(0.4)
         except Exception as exc:
             raise DriverError(f"could not scroll: {self._short(exc)}")
+        # What a page loads as it is scrolled to (more results) comes
+        # within the quiet.
+        await self.quiet(700)
 
     async def hover(self, n: int) -> None:
         try:
             await self._locator(n).hover(timeout=5000)
-            await asyncio.sleep(0.4)
         except Exception as exc:
             raise DriverError(f"element {n} could not be hovered: {self._short(exc)}")
+        await self.quiet(600)
 
     # -- tabs --------------------------------------------------------------
     async def tab(self, action: str, index: Optional[int] = None, url: str = "") -> None:
@@ -588,7 +644,7 @@ class Driver:
         else:
             raise DriverError(f"unknown tab action {action!r}")
         self._tabs_changed += 1
-        await self.settle(1.0)
+        await self.quiet(600)
 
     async def tabs(self) -> List[Dict[str, Any]]:
         """The open tabs, in their order, for whoever watches: a name,
@@ -637,7 +693,7 @@ class Driver:
             await self._locator(n).set_input_files(path, timeout=5000)
         except Exception as exc:
             raise DriverError(f"element {n} does not take a file: {self._short(exc)}")
-        await self.settle(1.0)
+        await self.quiet(800)
 
     # -- the person's hand -------------------------------------------------
     #: What the page says about an element: enough to name it in a

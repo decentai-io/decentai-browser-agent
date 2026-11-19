@@ -1,20 +1,16 @@
 """What a run remembers, and how much of it the mind is shown.
 
-Everything is kept: every action and how it went, every record, every
-word the person said. What is *shown* at a step is budgeted — a share
-of the step's prompt each — rather than counted: "the last eight
-actions" forgot the first client of seven by the time of the third,
-whatever the model could have read.
+Everything is kept by the code, never rewritten by the model: every
+action and what it changed, every record, every page visited, every
+word the person said, and what an earlier run in this chat did. What is
+*shown* at a step is budgeted — a share of the step's prompt each:
 
-Three things make a long run one piece of work:
-
-- **The account.** The newest actions are shown as they happened. The
-  older ones are folded, every so many steps, into an account the mind
-  writes itself: what is done, what was learned, what remains. Nothing
-  is forgotten; it is said in fewer words.
 - **The plan.** Each step of it has a state, so where the run stands is
   in front of the mind at every step.
-- **Recall.** What is no longer shown can be asked for.
+- **The ledger.** Pages visited and presses approved: facts, kept by
+  the code, which a summary would blur.
+- **The actions.** The newest whole; older ones shorter as room runs
+  out, and the oldest counted, with how to ``recall`` them.
 
 Wherever something is cut, the cut is said, with how to get the rest.
 """
@@ -25,22 +21,6 @@ import json
 import os
 import re
 from typing import Any, Dict, List
-
-FOLD_PROMPT = """You are partway through a task in a web browser. Older steps are about to leave your sight; write the account that replaces them.
-
-THE TASK: {goal}
-
-THE ACCOUNT SO FAR:
-{account}
-
-THE STEPS SINCE, oldest first:
-{steps}
-
-Write the account anew, as three short parts, in plain words:
-DONE — what has been finished, item by item, so nothing is done twice.
-LEARNED — what is true of this site that the work depends on: addresses that work, where things are, what a search wants, what failed and why.
-LEFT — what remains, in the order to do it.
-At most {limit} characters. Answer with the account only."""
 
 
 def cut(text: str, limit: int, rest: str = "") -> str:
@@ -160,31 +140,33 @@ class WorkingMemory:
     #: What one step's prompt may hold, in characters — the model's to
     #: read, not the agent's to guess: a deployment with a larger or a
     #: smaller model says so.
-    PROMPT_CHARS = int(os.environ.get("DECENTAI_BROWSER_PROMPT_CHARS") or 60000)
-    #: What each part may take of it. The page's words take what the
-    #: others leave, and never less than their own share.
-    SHARES = {"actions": 0.24, "account": 0.08, "records": 0.10, "notes": 0.07,
-              "said": 0.03, "elements": 0.22, "page": 0.20}
-    #: The newest actions are never folded: they are what just happened.
-    UNFOLDED = 6
-    #: The account is written again every this many steps.
-    FOLD_EVERY = int(os.environ.get("DECENTAI_BROWSER_FOLD_EVERY") or 10)
-    ACCOUNT_CHARS = 2400
+    PROMPT_CHARS = int(os.environ.get("DECENTAI_BROWSER_PROMPT_CHARS") or 48000)
+    #: What each part may take of it. The page's outline takes what the
+    #: others leave, and never less than its own share.
+    SHARES = {"actions": 0.20, "ledger": 0.06, "records": 0.08, "notes": 0.06, "said": 0.03,
+              "earlier": 0.05, "page": 0.45}
+    #: The newest actions are always shown whole.
+    WHOLE = 4
+    #: Pages the ledger names, the newest.
+    VISITED_SHOWN = 12
 
     def __init__(self):
         self.actions: List[Dict[str, str]] = []
         self.records: List[Dict[str, Any]] = []
         self.said: List[str] = []
-        self.account = ""
-        #: how many of the actions the account already holds
-        self.folded = 0
+        #: every address the run looked at, oldest first, once each
+        self.visited: List[str] = []
+        #: presses the person approved, in words
+        self.approved: List[str] = []
+        #: what an earlier run in this chat did, when this one continues it
+        self.earlier = ""
 
     def share(self, part: str) -> int:
         return int(self.PROMPT_CHARS * self.SHARES[part])
 
     # -- what is kept ------------------------------------------------------------------
-    def did(self, action: str, result: str) -> None:
-        self.actions.append({"action": str(action), "result": str(result)})
+    def did(self, action: str, result: str, state: str = "ok") -> None:
+        self.actions.append({"action": str(action), "result": str(result), "state": state})
 
     def heard(self, text: str) -> None:
         self.said.append(str(text)[:2000])
@@ -195,53 +177,50 @@ class WorkingMemory:
         self.records.extend(kept)
         return len(kept)
 
-    # -- the account ---------------------------------------------------------------------
-    def due(self, step: int) -> bool:
-        return step > 0 and step % self.FOLD_EVERY == 0 \
-            and len(self.actions) - self.folded > self.UNFOLDED
-
-    async def fold(self, call, goal: str) -> None:
-        """The actions older than the newest few, folded into the
-        account. When the mind cannot write it, the steps themselves
-        are kept in short, so nothing is lost to a failed call."""
-        upto = len(self.actions) - self.UNFOLDED
-        leaving = self.actions[self.folded:upto]
-        if not leaving:
+    def seen(self, url: str) -> None:
+        url = str(url or "")
+        if not url or url.startswith("about:") or (self.visited and self.visited[-1] == url):
             return
-        steps = "\n".join(f"- {a['action']} → {cut(a['result'], 700)}" for a in leaving)
-        written = ""
-        try:
-            written = str(await call.model(FOLD_PROMPT.format(
-                goal=goal, account=self.account or "(none yet)", steps=steps,
-                limit=self.ACCOUNT_CHARS)) or "").strip()
-        except Exception:
-            written = ""
-        if written:
-            self.account = written[: self.ACCOUNT_CHARS]
-        else:
-            short = "\n".join(f"- {a['action']} → {a['result'][:120]}" for a in leaving)
-            self.account = (self.account + "\n" + short).strip()[-self.ACCOUNT_CHARS:]
-        self.folded = upto
+        if url in self.visited:
+            self.visited.remove(url)
+        self.visited.append(url)
+
+    def handed_on(self, goal: str, outcome: str, summary: str) -> str:
+        """What this run did, as the next run in the chat is told it."""
+        lines = [f"- {a['action']} → {cut(a['result'], 160)}" for a in self.actions[-15:]]
+        return (f"Goal: {goal}\nOutcome: {outcome}: {cut(summary, 600)}\n"
+                f"Pages: {', '.join(self.visited[-8:])}\n{len(self.records)} records kept.\n"
+                "Its last actions:\n" + "\n".join(lines)).strip()
 
     # -- what is shown ---------------------------------------------------------------------
+    def ledger_shown(self) -> str:
+        parts = []
+        if self.visited:
+            pages = self.visited[-self.VISITED_SHOWN:]
+            more = len(self.visited) - len(pages)
+            parts.append("Pages visited (oldest first): " + (f"[{more} earlier] " if more else "")
+                         + " | ".join(pages))
+        if self.approved:
+            parts.append("Approved by the person: " + "; ".join(self.approved[-8:]))
+        return cut("\n".join(parts), self.share("ledger"))
+
     def actions_shown(self) -> str:
-        """The actions not yet in the account, oldest first, within
-        their share: the newest in full, the older ones given less when
-        room runs short."""
-        waiting = self.actions[self.folded:]
-        if not waiting:
+        """Every action, oldest first, within their share: the newest
+        whole, older ones given less as room runs short, the oldest
+        counted."""
+        if not self.actions:
             return ""
         room = self.share("actions")
         lines: List[str] = []
-        for index, action in enumerate(reversed(waiting)):
-            # The newest action may take half of what is left; each one
-            # before it, half again — a read a moment ago is whole, a
-            # read ten steps ago is its beginning.
-            allowed = max(200, room // 2)
-            line = f"- {action['action']} → " + cut(
+        for index, action in enumerate(reversed(self.actions)):
+            # The newest may take half of what is left; each one before
+            # it, half again — a read a moment ago is whole, a read ten
+            # actions ago is its beginning.
+            allowed = max(200, room // 2) if index < self.WHOLE else max(160, room // 6)
+            line = f"{len(self.actions) - index}. {action['action']} → " + cut(
                 action["result"], allowed, "recall finds it again")
-            if len(line) > room and index >= self.UNFOLDED:
-                lines.append(f"[{len(waiting) - index} older actions are not shown: recall finds them]")
+            if len(line) > room and index >= self.WHOLE:
+                lines.append(f"[{len(self.actions) - index} older actions are not shown: recall finds them]")
                 break
             lines.append(line)
             room = max(0, room - len(line))
