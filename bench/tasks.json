@@ -1,0 +1,32 @@
+[
+ {
+  "id": "fact",
+  "url": "https://en.wikipedia.org/wiki/Cairo",
+  "goal": "Report the population of Cairo as the article's infobox states it, with the year it is for."
+ },
+ {
+  "id": "list",
+  "url": "https://books.toscrape.com/",
+  "goal": "Open the Travel category and list every book in it with its title and price."
+ },
+ {
+  "id": "pages",
+  "url": "https://quotes.toscrape.com/",
+  "goal": "List every quote by Albert Einstein on the first three pages of quotes, with the page each is on."
+ },
+ {
+  "id": "wait",
+  "url": "https://demoqa.com/dynamic-properties",
+  "goal": "Some buttons on this page change or appear only after a few seconds. Report the label of the button that becomes visible after a few seconds, and the colour the other changing button turns."
+ },
+ {
+  "id": "change",
+  "url": "https://demoqa.com/checkbox",
+  "goal": "Tick the box for Downloads, then report the list the page shows of what is selected."
+ },
+ {
+  "id": "submit",
+  "url": "https://demoqa.com/text-box",
+  "goal": "Fill in Full Name 'Test Person', Email 'test.person@example.com', Current Address '1 Test Street, Testville' and Permanent Address '2 Test Road, Testville', submit the form, and report what the page shows after."
+ }
+]
