@@ -2,7 +2,7 @@ schema: 3
 agent:
   id: browser
   name: Browser
-  version: "2.0.1"
+  version: "2.0.2"
   description: >
     Drives a real web browser to do what you ask on any site — the sites nothing else covers: prefer a dedicated agent when
     one is installed for the site. Find things, fill forms, put items in a basket, read what a page says. You watch it in

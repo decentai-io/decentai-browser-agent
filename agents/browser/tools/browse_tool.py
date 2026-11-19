@@ -133,6 +133,13 @@ WATCH_MAX_SECONDS = 3600
 WATCH_IDLE_FRAME_SECONDS = 1.0
 
 
+#: A chat's browser nobody has used for this long is closed: Chromium is
+#: most of a process's memory, and a sandbox holds many processes. Where
+#: it was and what the last run did are kept, and its sign-ins are on the
+#: site's session record, so the next run opens a browser there.
+IDLE_CLOSE_SECONDS = int(os.environ.get("DECENTAI_BROWSER_IDLE_SECONDS") or 180)
+
+
 class Kept:
     """The chat's browser, kept open between its runs: the next run
     finds the page the last one left, and is told what that run did.
@@ -143,6 +150,8 @@ class Kept:
         self.lock = asyncio.Lock()
         #: what the last run in this browser did, for the next one
         self.last = ""
+        #: the browser's own idle clock, while no call uses it
+        self.closing: Optional[asyncio.Task] = None
 
 
 class Browser:
@@ -155,11 +164,36 @@ class Browser:
     def __init__(self):
         self.kept: Optional[Kept] = None
         self.was = ""
+        #: what the last run did, kept when its browser is closed for want of use
+        self.last = ""
 
     def get(self) -> Optional[Kept]:
         if self.kept is not None and self.kept.driver.page is None:
             self.kept = None
+        if self.kept is not None and self.kept.closing is not None:
+            self.kept.closing.cancel()
+            self.kept.closing = None
         return self.kept
+
+    def idle(self) -> None:
+        """No call uses the browser now: it is closed after IDLE_CLOSE_SECONDS
+        unless one does meanwhile."""
+        kept = self.kept
+        if kept is None or IDLE_CLOSE_SECONDS <= 0:
+            return
+        if kept.closing is not None:
+            kept.closing.cancel()
+
+        async def close() -> None:
+            await asyncio.sleep(IDLE_CLOSE_SECONDS)
+            if self.kept is not kept or kept.lock.locked():
+                return
+            if kept.driver.page is not None:
+                self.remember(kept.driver.page.url)
+            self.last, self.kept = kept.last, None
+            await kept.driver.stop()
+
+        kept.closing = asyncio.get_running_loop().create_task(close())
 
     def keep(self, driver: Driver) -> Kept:
         if self.kept is None or self.kept.driver is not driver:
@@ -192,6 +226,9 @@ class BrowseTool(ToolBase):
     #: the run: the model is told each time what was wrong, and a model
     #: that cannot answer three times will not on the tenth.
     UNREADABLE_STOP = 3
+    #: Answers in a row the provider refused to give (its filter): the
+    #: same page will be refused again, so two end the run, said as that.
+    REFUSED_STOP = 2
     #: Actions meant to change the page: what they changed is measured.
     MOVING = frozenset(("click", "type", "select", "press", "scroll", "goto", "back",
                         "tab", "hover", "login", "code", "download", "upload", "handoff"))
@@ -233,8 +270,11 @@ class BrowseTool(ToolBase):
         kept = BROWSER.get()
         if kept is not None:
             async with kept.lock:
-                return await self._run_in(call, kept.driver, goal, start_url,
-                                          max_steps, continuing=True, earlier=kept.last)
+                try:
+                    return await self._run_in(call, kept.driver, goal, start_url,
+                                              max_steps, continuing=True, earlier=kept.last)
+                finally:
+                    BROWSER.idle()
         if not start_url:
             # No browser and no address: where the chat's browser was
             # when it last closed, if anywhere.
@@ -246,7 +286,13 @@ class BrowseTool(ToolBase):
                     "summary": "No browser is open in this chat and no "
                                "start_url was given: say where to start."}, "success"
         driver = Driver(headless=self._headless())
-        return await self._run_in(call, driver, goal, start_url, max_steps, continuing=False)
+        try:
+            # A browser closed for want of use: what its last run did is
+            # still told to this one.
+            return await self._run_in(call, driver, goal, start_url, max_steps, continuing=False,
+                                      earlier=BROWSER.last)
+        finally:
+            BROWSER.idle()
 
     async def _run_in(self, call, driver: Driver, goal: str, start_url: str,
                       max_steps: int, continuing: bool, earlier: str = ""):
@@ -360,6 +406,7 @@ class BrowseTool(ToolBase):
             await call.screen.close()
         except Exception:
             pass
+        BROWSER.idle()
         url = driver.page.url if driver.page is not None else ""
         return {"outcome": outcome, "final_url": url,
                 "summary": {"closed": "The person closed the live view.",
@@ -432,8 +479,10 @@ class _Run:
         self.goal = goal
         self.domain = domain
         self.steps = 0
-        #: answers in a row that could not be read as actions
+        #: answers in a row that could not be read as actions, and that
+        #: the provider refused to give
         self.unreadable = 0
+        self.refusals = 0
         self.approvals: List[str] = []
         self.handoffs = 0
         self.downloads: List[Dict[str, Any]] = []
@@ -556,11 +605,13 @@ class _Run:
                 began = time.monotonic()
                 snapshot = fresh if fresh is not None else await self.driver.snapshot()
                 fresh = None
-                # A picture when the outline is not enough: the first
-                # look at a page, a page the outline says little about,
-                # a frame a person could act in, or the model asked.
+                # A picture when the outline is not enough: the run's
+                # first look, a page the outline says little about, a
+                # frame a person could act in, or the model asked. Not at
+                # every new address: a step with a picture is never served
+                # from the provider's cache, and the outline holds the page.
                 sparse = len(snapshot.elements) < 3 and len(snapshot.outline) < 300
-                if look or snapshot.url != pictured or sparse or snapshot.frames:
+                if look or not pictured or sparse or snapshot.frames:
                     snapshot.image = await self.driver.picture()
                     pictured = snapshot.url
                 look = False
@@ -616,6 +667,12 @@ class _Run:
             await self.call.progress(line)
             live.set(now=line)
             self.unreadable = self.unreadable + 1 if what == "invalid" else 0
+            self.refusals = self.refusals + 1 if what == "invalid" and action.get("refused") else 0
+            if self.refusals >= BrowseTool.REFUSED_STOP:
+                return {"outcome": "failed",
+                        "summary": f"The model's provider refused to answer about {before.url} "
+                                   f"{self.refusals} times in a row (its content filter, most likely), after "
+                                   f"{self.steps} steps; the page's content is what it would not take."}, None, False
             if self.unreadable >= BrowseTool.UNREADABLE_STOP:
                 how = ("were cut off before they ended" if action.get("cut")
                        else "could not be read as actions")
@@ -858,7 +915,10 @@ class _Run:
         elif what == "finish":
             return await self.finish(action, snapshot, line), None, ""
         elif what == "invalid":
-            if action.get("cut"):
+            if action.get("refused"):
+                result = ("the model's provider refused to answer (its content filter): nothing was done; "
+                          "what is on this page may be what it refuses")
+            elif action.get("cut"):
                 result = ("your answer was cut off before it ended, so nothing was done: "
                           "answer with less — fewer and shorter records in one remember")
             else:
@@ -880,6 +940,11 @@ class _Run:
             return {"outcome": "failed", "summary": summary}
         self.live.set(status="thinking", now="Checking the page shows the goal done")
         check = await self.driver.snapshot()
+        evidence = " ".join(str(action.get("evidence") or "").split())
+        if len(evidence) >= 12 and evidence.lower() in " ".join(check.text.split()).lower():
+            # The words the model gave as its evidence are on the page as
+            # it is now, word for word: nothing for a check to add.
+            return {"outcome": "done", "summary": summary}
         if len(check.elements) < 3 and len(check.outline) < 300:
             check.image = await self.driver.picture()
         verdict = await self.brain.verify(self.goal, summary, str(action.get("evidence") or ""), check)
@@ -1278,6 +1343,8 @@ class _Run:
     def _line(action: Dict[str, Any], snapshot: Snapshot) -> str:
         what = str(action.get("do") or "?")
         if what == "invalid":
+            if action.get("refused"):
+                return "the model's provider refused to answer"
             return ("the model's answer was cut off before it ended" if action.get("cut")
                     else "the model's answer could not be read")
         n = action.get("n")

@@ -59,7 +59,9 @@ class Shopper:
 
     async def __call__(self, messages, max_tokens=None, pictures=None):
         text = messages[-1]["text"]
-        self.prompts.append(text)
+        # What the model is told is the system text and the step's: the
+        # run's goal and notes are in the first, the page in the second.
+        self.prompts.append("\n\n".join(m["text"] for m in messages))
         if pictures:
             self.pictures += len(pictures)
         if text.startswith("The person asked a browser agent:"):
@@ -234,8 +236,8 @@ class SignerIn(Shopper):
         text = messages[-1]["text"]
         page = text.split("OUTLINE:")[-1]
         inputs = re.findall(r'^\[(\d+)\] (textbox)[^"\n]*"([^"]*)"', page, re.M)
-        if inputs and text.startswith("GOAL:"):
-            self.prompts.append(text)
+        if inputs and text.startswith("STEP "):
+            self.prompts.append("\n\n".join(m["text"] for m in messages))
             fields = []
             for n, _kind, words in inputs:
                 said = {"n": int(n)}
