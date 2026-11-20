@@ -2,7 +2,7 @@ schema: 3
 agent:
   id: browser
   name: Browser
-  version: "2.0.2"
+  version: "2.1.0"
   description: >
     Drives a real web browser to do what you ask on any site — the sites nothing else covers: prefer a dedicated agent when
     one is installed for the site. Find things, fill forms, put items in a basket, read what a page says. You watch it in
@@ -64,7 +64,7 @@ resources:
       fields:
         - {name: domain, label: Domain, type: string, storage: keys, required: true}
         - {name: updated_at, label: Updated At, type: string, storage: keys, required: true}
-        - {name: notes, label: Notes, type: string, storage: keys, required: true}
+        - {name: notes, label: Notes, type: string, storage: values, required: true}
 functions:
   - id: browse_run
     name: Run
@@ -88,6 +88,7 @@ functions:
       - record.create:session
       - record.update:session
       - record.list:notes
+      - record.read:notes
       - record.create:notes
       - record.update:notes
       - record.list:logins
@@ -152,7 +153,7 @@ functions:
       A picture of one page as a file, with its title and the address it ended at. Nothing is clicked, nothing is read for
       the user, nothing streams to the chat. Only when the user asks for a screenshot of an address; every other request
       about a site is run.
-    level: 2
+    level: 0
     timeout_seconds: 120
     inputs:
       type: object

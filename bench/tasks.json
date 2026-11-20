@@ -28,5 +28,35 @@
   "id": "submit",
   "url": "https://demoqa.com/text-box",
   "goal": "Fill in Full Name 'Test Person', Email 'test.person@example.com', Current Address '1 Test Street, Testville' and Permanent Address '2 Test Road, Testville', submit the form, and report what the page shows after."
+ },
+ {
+  "id": "signin",
+  "url": "https://the-internet.herokuapp.com/login",
+  "goal": "Sign in with the username tomsmith and the password SuperSecretPassword! (a public demo account), then report the message the page shows after signing in."
+ },
+ {
+  "id": "spa",
+  "url": "https://demo.playwright.dev/todomvc/",
+  "goal": "Add three todos: 'Buy milk', 'Call Dana' and 'Book flights'. Mark 'Call Dana' as completed, then report how many items the page says are left."
+ },
+ {
+  "id": "download",
+  "url": "https://the-internet.herokuapp.com/download",
+  "goal": "Download the first text file (.txt) listed on the page and report its name."
+ },
+ {
+  "id": "arabic",
+  "url": "https://ar.wikipedia.org/wiki/%D8%A7%D9%84%D9%82%D8%A7%D9%87%D8%B1%D8%A9",
+  "goal": "Report the population of Cairo as this Arabic article's infobox states it, with the year it is for, in Arabic as written."
+ },
+ {
+  "id": "paged",
+  "url": "https://books.toscrape.com/",
+  "goal": "Open the Mystery category and list every book in it with its title and price, across all of its pages."
+ },
+ {
+  "id": "table",
+  "url": "https://the-internet.herokuapp.com/tables",
+  "goal": "In the first table, find the person with the largest amount due, and report their name, email and the amount."
  }
 ]

@@ -125,7 +125,7 @@ control: approvals stay on the platform's cards.
 |---|---|---|
 | `browse_run` | 1 | Does what the goal says from `start_url`, up to `max_steps` (60 by default, 200 at most). Without `start_url` it continues on the page the chat's browser was left at. `files` are what the person attached for a page to take (`upload`). Returns the outcome (`done`, `stopped`, `stopped_by_person` when the user answered Stop, `failed`, `budget`), a summary, the records found, the steps taken, the final URL, a screenshot's `file_ref`, what was approved, how many handoffs, any downloads (each returned to the chat as a file), and the run's figures |
 | `browse_watch` | 0 | Shows the chat's browser in the live view before anything is asked of it, so the person can look, sign in or go somewhere; the model calls it when the person wants to see or use the browser, not as a step in a task. `action: quit` closes the browser and remembers where it was |
-| `browse_screenshot` | 2 | Opens a page and returns a screenshot as a file, with its title and final URL |
+| `browse_screenshot` | 0 | Opens a page and returns a screenshot as a file, with its title and final URL |
 
 A process serves one chat, so it holds one browser: it stays open after
 a run, and a follow-up in the same chat continues where the last run
@@ -182,7 +182,7 @@ run opens a browser there, signed in by the site's session.
 - **Sessions** (`session` records, encrypted): a site's cookies after a
   sign-in or a handoff, keyed by domain and account, so the next run
   skips the form.
-- **Site notes** (`notes` records, editable by the person), by
+- **Site notes** (`notes` records, encrypted, editable by the person), by
   section — signing in, finding things, what to avoid, what the person
   did themselves, and the names the sign-in's fields are saved under —
   each rewritten on its own after a run, read before the next on that

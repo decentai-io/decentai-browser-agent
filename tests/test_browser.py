@@ -312,7 +312,7 @@ class TestSigningIn:
         assert shop.logins == [ACCOUNT] and shop.orders == [["d20"]]
         # What was filled is nobody's but the page's.
         assert not any(PASSWORD in p or ACCOUNT in p for p in mind.prompts)
-        [notes] = [row["keys"]["notes"] for row in provider.data["notes"].values()]
+        [notes] = [row["values"]["notes"] for row in provider.data["notes"].values()]
         assert "NAMES OF THE SIGN-IN FIELDS" in notes and "username = " in notes and "password = " in notes
 
     def test_a_form_that_asks_for_more_than_a_login(self, agents, shop):
@@ -495,7 +495,7 @@ class TestShopping:
         [session] = provider.data["session"].values()
         assert session["keys"]["account"] == ACCOUNT and session["values"]["state"]["cookies"]
         [notes] = provider.data["notes"].values()
-        assert "Place order" in notes["keys"]["notes"]
+        assert "Place order" in notes["values"]["notes"]
 
     def test_the_next_run_of_a_chat_continues_in_the_open_browser(self, agents, shop):
         """The browser stays open after a run; a follow-up in the same
@@ -553,7 +553,7 @@ class TestShopping:
             closed = await asyncio.wait_for(watching, 20)
             # What the person did in the watched browser is on the
             # site's notes, before any run rewrites them.
-            noted = [row["keys"]["notes"] for row in provider.data.get("notes", {}).values()]
+            noted = [row["values"]["notes"] for row in provider.data.get("notes", {}).values()]
             seen.pop("call_id")
             # A second watch stays up while a run takes the browser; the
             # person keeps watching, and closes it when the run is done.

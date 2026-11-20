@@ -525,9 +525,15 @@ class _Run:
     async def load_notes(self) -> SiteNotes:
         try:
             rows = await self.call.records.list("notes", {"domain": self.domain})
+            if not rows:
+                return SiteNotes()
+            # The notes are encrypted (values) since 2.1.0, so a listing doesn't carry them: the record is read.
+            # Notes kept by an earlier version in plain keys come back in the listing.
+            listed = str(rows[0]["fields"].get("notes") or "")
+            read = await self.call.records.read("notes", rows[0]["ref"])
+            return SiteNotes(str((read.get("fields") or {}).get("notes") or listed))
         except Exception:
             return SiteNotes()
-        return SiteNotes(str(rows[0]["fields"].get("notes") or "") if rows else "")
 
     async def save_notes(self, notes: SiteNotes) -> None:
         text = notes.text()
