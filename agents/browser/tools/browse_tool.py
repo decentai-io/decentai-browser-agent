@@ -1198,13 +1198,22 @@ class _Run:
                        if not question["remember"] or "value" not in (answers.get(name) or {})}
             if missing:
                 kept = {name: answer for name, answer in answers.items() if name not in missing}
-                answers = (await records.update("logins", ref, {"answers": {**kept, **missing}}))[
-                    "fields"].get("answers") or {}
+                # The platform answers an update with its ref, and hands back once the answers the person gave
+                # but asked not to keep (a code); what it kept is read again (seen live, 2.1.0: there is no
+                # "fields" in an update's answer).
+                updated = await records.update("logins", ref, {"answers": {**kept, **missing}})
+                answers = dict((await records.read("logins", ref)).get("fields", {}).get("answers") or {})
+                for name, value in (updated.get("once") or {}).items():
+                    answers[name] = {"value": value}
         except ResourceDenied as exc:
             if exc.code != "refused":
                 raise
             return None
-        return {name: str((answers.get(name) or {}).get("value") or "") for name in asked}
+        values = {name: str((answers.get(name) or {}).get("value") or "") for name in asked}
+        if any(not value for value in values.values()):
+            # The form came back without them: the person did not give them, so nothing is typed into the page.
+            return None
+        return values
 
     async def yield_to_person(self) -> None:
         """The person took the browser in the live view without being

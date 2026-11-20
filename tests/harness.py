@@ -634,10 +634,21 @@ class Chat:
             return {"deleted": True}, []
         if operation == "update":
             fields = await self.filled(resource, kind, inputs.get("fields") or {}, whole=False)
+            # As the platform: a form's answers the person gave but asked not to keep are handed back once, never
+            # stored; the answer is the ref (and those), not the record (agents.md §9, record.update).
+            once = {}
+            for field in resource.get("fields") or []:
+                if field["type"] == "form" and isinstance(fields.get(field["name"]), dict):
+                    for name, question in list(fields[field["name"]].items()):
+                        if isinstance(question, dict) and not question.get("remember", True) and "value" in question:
+                            once[name] = question["value"]
+                            fields[field["name"]][name] = {k: v for k, v in question.items() if k != "value"}
             keys, values = self.provider.split(resource, {k: v for k, v in fields.items() if v is not None},
                                                oauth=bool(resource.get("oauth")))
             kept[ref]["keys"].update(keys)
             kept[ref]["values"].update(values)
+            if kind != "files":
+                return {"ref": ref, **({"once": once} if once else {})}, []
         if kind == "files":
             file = kept[ref]
             path = agent.handed(file["name"], file["content"], ref)
