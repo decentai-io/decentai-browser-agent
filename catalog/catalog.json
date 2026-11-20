@@ -11,7 +11,7 @@
         "agent": {
           "id": "browser",
           "name": "Browser",
-          "version": "2.1.0",
+          "version": "2.1.1",
           "description": "Drives a real web browser to do what you ask on any site — the sites nothing else covers: prefer a dedicated agent when one is installed for the site. Find things, fill forms, put items in a basket, read what a page says. You watch it in the chat, with an inspector beside the page showing what it does, what the page fetches and what it plans next, and can take over when a site wants a human. Logins are asked for once and saved as your secrets; paying, ordering, sending or deleting always stops for your approval.\n",
           "instructions": "Use this agent when the user wants something done on a website that no other agent covers, or wants a page read as a person would see it. browse_run takes the goal in the user's own words and a starting address, and the files the user attached that a page must take (files); it returns what was done, what was found (records, shown as a table when there are several), the final address and a screenshot. The user sees the browser live in the chat and may be asked to take over — say so when the result mentions a handoff. Logins are handled by the agent through the user's saved secrets: never ask the user for a password in the chat. Anything that cannot be taken back — paying, ordering, sending, deleting, publishing — stops for the user's approval, and so does any change at all when the user asked only to look: say in the goal when that is so. Tell them what was approved. For data a site already holds as a list — tickets, orders, rows — say in the goal what is wanted of every row: the agent reads what the page fetched rather than the screen. A result whose outcome is \"budget\" ran out of steps: offer to continue with a narrower goal. When the user wants to see the browser or use it themselves — to sign in by hand, say — call browse_watch. browse_screenshot only looks at a page and returns a picture.\n",
           "examples": [
@@ -357,14 +357,14 @@
       },
       "programs": {
         "x86_64": {
-          "url": "https://github.com/decentai-io/decentai-browser-agent/releases/download/v2.1.0/x86_64.zip",
-          "digest": "sha256:2617aed44d9bcae3b3723338a4a3d50c00b7755584470e446ca757ae39e81f8e",
-          "size": 225305929
+          "url": "https://github.com/decentai-io/decentai-browser-agent/releases/download/v2.1.1/x86_64.zip",
+          "digest": "sha256:445448f636c8fdf4f988e63fcc09e49f90932558b1a6ae02ea34d67180b00daa",
+          "size": 225306146
         },
         "aarch64": {
-          "url": "https://github.com/decentai-io/decentai-browser-agent/releases/download/v2.1.0/aarch64.zip",
-          "digest": "sha256:10e0557a1d6a46a6e877dcb432fa7db2df42df23bfa4a36420c3a28e6d4df99f",
-          "size": 252585959
+          "url": "https://github.com/decentai-io/decentai-browser-agent/releases/download/v2.1.1/aarch64.zip",
+          "digest": "sha256:7200c060a438091524fec99c7b01fa3f9bf8ba27a354525a204f505b2c3cad63",
+          "size": 252586176
         }
       },
       "base": "python-3.12",
